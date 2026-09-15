@@ -1,0 +1,11 @@
+{
+  "remove_background": {
+    "description": "ML background removal with rembg (pip install rembg[cli]).",
+    "command": "rembg i -m {model} {in} {out}",
+    "params": { "model": "u2net" }
+  },
+  "upscale_2x": {
+    "description": "Example of any command-line tool: {in} and {out} are PNG paths, other {params} come from the tool call.",
+    "command": "convert {in} -resize 200% {out}"
+  }
+}

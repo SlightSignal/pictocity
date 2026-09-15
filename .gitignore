@@ -1,0 +1,17 @@
+node_modules/
+packages/*/dist/
+
+# runtime data (documents, assets, exports) -- created by the server
+data/
+
+# local machine config; copy image-tools.example.json to create one
+image-tools.json
+
+# portable-exe build artifacts (packaging/build.py)
+packaging/_payload/
+build_exe/
+dist_exe/
+
+*.log
+fonts/Test-*.ttf
+packaging/*.spec

@@ -1,0 +1,24 @@
+{
+  "name": "pictocity",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Photoshop-style ad editor with a JSON layer document, a headless renderer and an MCP server so an agent and a human can edit the same file.",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w @pictocity/core && npm run build -w @pictocity/server && npm run build -w @pictocity/mcp && npm run build -w @pictocity/editor",
+    "dev": "npm run dev -w @pictocity/server & npm run dev -w @pictocity/editor",
+    "server": "node packages/server/dist/index.js",
+    "mcp": "node packages/mcp/dist/index.js",
+    "demo": "node packages/server/dist/demo.js",
+    "test": "node tools/core-tests.mjs",
+    "test:ui": "node tools/ui-smoke.mjs",
+    "doctor": "node tools/doctor.mjs",
+    "check": "npm run build && npm test",
+    "test:api": "node tools/api-tests.mjs"
+  },
+  "devDependencies": {
+    "puppeteer-core": "^25.10.0"
+  }
+}
