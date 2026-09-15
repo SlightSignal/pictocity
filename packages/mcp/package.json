@@ -1,0 +1,14 @@
+{
+  "name": "@pictocity/mcp",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": { "pictocity-mcp": "dist/index.js" },
+  "scripts": { "build": "tsc -p tsconfig.json", "start": "node dist/index.js" },
+  "dependencies": {
+    "@pictocity/core": "*",
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": { "@types/node": "^22.0.0", "typescript": "^5.6.0" }
+}
