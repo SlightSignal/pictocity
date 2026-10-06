@@ -18,6 +18,12 @@ check("create document", !!doc?.id);
 const layer = { type: "shape", id: "s1", name: "Box", shape: "rect", x: 10, y: 10, width: 100, height: 80, fill: "#f00", strokeColor: null, strokeWidth: 0, visible: true, locked: false, opacity: 1, blend: "normal", rotation: 0, scaleX: 1, scaleY: 1 };
 const ok1 = await post(`/api/docs/${doc.id}/ops`, { actor: "t", ops: [{ type: "layer.add", layer, parentId: null, index: 0 }] });
 check("apply op", ok1.status === 200 && ok1.body.rev === 1, JSON.stringify(ok1.body).slice(0, 100));
+const current = (await j(`/api/docs/${doc.id}`)).body;
+const imported = await post("/api/docs", { document: current });
+check("importing an existing id makes a new document", imported.status === 201 && imported.body.id !== doc.id && (await j(`/api/docs/${doc.id}`)).body.rev === 1);
+if (imported.status === 201) await j(`/api/docs/${imported.body.id}`, { method: "DELETE" });
+const stale = await post(`/api/docs/${doc.id}/ops`, { expectedRev: 0, ops: [{ type: "doc.set", props: { name: "stale" } }] });
+check("stale expected revision is 409", stale.status === 409 && (await j(`/api/docs/${doc.id}`)).body.rev === 1);
 
 // ---- Validation through the API -------------------------------------------------------
 check("NaN through JSON (null) on a required prop is rejected", (await post(`/api/docs/${doc.id}/ops`, { actor: "t", ops: [{ type: "layer.set", id: "s1", props: { x: null } }] })).status === 400);
@@ -31,7 +37,7 @@ check("locked layer refuses edits", await (async () => { await post(`/api/docs/$
 const big = await j(`/api/docs/${doc.id}/render.png?scale=1000`);
 check("huge render scale is clamped, not a crash", big.status === 200 || big.status === 400, `status ${big.status}`);
 const gifAbuse = await j(`/api/docs/${doc.id}/export?format=gif&fps=100000`);
-check("absurd fps is clamped", gifAbuse.status === 200 || gifAbuse.status === 400, `status ${gifAbuse.status}`);
+check("absurd fps is refused before allocation", gifAbuse.status === 400, `status ${gifAbuse.status}`);
 check("quality out of range is tolerated", (await j(`/api/docs/${doc.id}/export?format=jpg&quality=999`)).status === 200);
 check("negative scale is rejected or clamped", [200, 400].includes((await j(`/api/docs/${doc.id}/export?format=png&scale=-2`)).status));
 check("unknown export format is 400", (await j(`/api/docs/${doc.id}/export?format=exe`)).status === 400);

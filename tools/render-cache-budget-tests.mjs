@@ -1,0 +1,26 @@
+import assert from 'node:assert/strict';
+import { readFileSync,existsSync,mkdirSync,writeFileSync } from 'node:fs';
+import { resolve,join } from 'node:path';
+import { pathToFileURL,fileURLToPath } from 'node:url';
+import { registerHooks } from 'node:module';
+import { createHash } from 'node:crypto';
+import ts from 'typescript';
+import { createCanvas } from '@napi-rs/canvas';
+globalThis.location={href:'http://127.0.0.1:4100/'};globalThis.history={replaceState(){}};globalThis.sessionStorage={getItem(){return null;},setItem(){}};
+globalThis.window={fetch:globalThis.fetch,addEventListener(){},removeEventListener(){}};
+globalThis.document={visibilityState:'hidden',createElement(tag){assert.equal(tag,'canvas');return createCanvas(1,1);},addEventListener(){},removeEventListener(){}};
+const editor=pathToFileURL(resolve('packages/editor/src/')).href;
+registerHooks({resolve(specifier,context,next){if(context.parentURL?.startsWith(editor)&&specifier.startsWith('.')){for(const ext of ['.ts','.tsx']){const url=new URL(specifier+ext,context.parentURL);if(existsSync(fileURLToPath(url)))return {url:url.href,shortCircuit:true};}}return next(specifier,context);},load(url,context,next){if(url.startsWith(editor)&&/\.tsx?$/.test(url))return {format:'module',shortCircuit:true,source:ts.transpileModule(readFileSync(fileURLToPath(url),'utf8'),{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2022}}).outputText};return next(url,context);}});
+const {renderCache}=await import('../packages/editor/src/env.ts');
+const label=process.env.PICTOCITY_CACHE_BUDGET_LABEL??new Date().toISOString().replace(/[:.]/g,'-');assert.match(label,/^[a-zA-Z0-9-]+$/);
+const root=resolve('tools/render-cache-budget-evidence',label);mkdirSync(root,{recursive:true});
+const report={schema:'pictocity-render-cache-budget/v1',scope:'actual production browser cache with dimension-only fixtures; accounting admission, not measured RSS or real huge-canvas allocation',sourceSha256:createHash('sha256').update(readFileSync('packages/editor/src/env.ts')).digest('hex'),cases:[]};
+const entry=(width,height,alpha=false)=>({canvas:{width,height},x:0,y:0,...(alpha?{alpha:{width,height}}:{})});
+let failed=0;function test(name,fn){renderCache.clear();try{fn();report.cases.push({name,status:'pass'});console.log('ok '+name);}catch(e){failed++;report.cases.push({name,status:'fail',error:String(e)});console.log('FAIL '+name+': '+e.message);}writeFileSync(join(root,'report.json'),JSON.stringify(report,null,2));}
+test('A single oversized canvas is never retained as the last cache entry',()=>{renderCache.set('large',entry(8192,8193));assert.equal(renderCache.get('large'),undefined);});
+test('Alpha doubles the accounted payload and oversize admission keeps useful small entries',()=>{const small=entry(64,64);renderCache.set('small',small);renderCache.set('alpha-large',entry(8192,8192,true));assert.equal(renderCache.get('alpha-large'),undefined);assert.equal(renderCache.get('small'),small);});
+test('Oversized replacement removes the old value rather than leaving stale pixels under the key',()=>{renderCache.set('same',entry(64,64));renderCache.set('same',entry(8192,8193));assert.equal(renderCache.get('same'),undefined);});
+test('Exactly 256 MiB is admitted but another item evicts the least recently used entry',()=>{const limit=entry(8192,8192);renderCache.set('limit',limit);assert.equal(renderCache.get('limit'),limit);renderCache.set('small',entry(64,64));assert.equal(renderCache.get('limit'),undefined);assert.ok(renderCache.get('small'));});
+test('Recent reads protect their item when the 400-entry limit is reached',()=>{for(let i=0;i<400;i++)renderCache.set(String(i),entry(1,1));assert.ok(renderCache.get('0'));renderCache.set('new',entry(1,1));assert.ok(renderCache.get('0'));assert.equal(renderCache.get('1'),undefined);assert.ok(renderCache.get('new'));});
+test('Clearing releases keys and accounting before a fresh budget',()=>{renderCache.set('limit',entry(8192,8192));renderCache.clear();const a=entry(4096,4096);for(let i=0;i<4;i++)renderCache.set(String(i),a);assert.ok(renderCache.get('0'));assert.equal(renderCache.get('limit'),undefined);});
+report.passed=report.cases.length-failed;report.failed=failed;writeFileSync(join(root,'report.json'),JSON.stringify(report,null,2));console.log(JSON.stringify({passed:report.passed,failed,report:join(root,'report.json')}));if(failed)process.exitCode=1;
