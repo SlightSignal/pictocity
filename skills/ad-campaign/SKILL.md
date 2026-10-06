@@ -10,7 +10,7 @@ You have two production tools with the same design: a JSON document, every edit 
 ## 0. Before designing
 
 1. `get_brand` (pictocity). If empty, ask for or infer the brand and store it with `set_brand`: colours with roles (`primary`, `accent`, `background`, `text`), fonts with roles (`headline`, `body`), voice, hard rules (claims you can't make, mandatory legal line, logo clearance), audio identity (target loudness, sonic logo asset if any). Brand colours show up in the human's Swatches panel.
-2. `list_fonts`. If the brand font isn't served, `install_font` it (path or URL) — otherwise the human's preview and your export will differ.
+2. `list_fonts` returns a JSON array: system fonts are strings, hosted families are records with files, weight/style/stretch, hashes and diagnostics. Parse both shapes. If the brand font isn't served, `install_font` it (path or URL) — otherwise the human's preview and your export will differ.
 3. Confirm the deliverables: platforms, sizes, copy variants, languages, duration for audio/video. Use `list_presets` for sizes; the groups are Social, Display, Screens, Print.
 
 ## 1. Build the master format first
@@ -38,6 +38,8 @@ You have two production tools with the same design: a JSON document, every edit 
 - Re-render and look once more after fixes.
 
 ## 5. Export
+
+- Call `preflight_document` on the current document. For `export_set`, carry both its `revision` as `expectedRev` and `resourceSnapshot.sha256` as `expectedResources`, with the reviewed format/scales/artboard/comp selections. A 409 requires a fresh preflight and reconciliation; do not blindly replay. The UI makes one transaction for a multi-file export and offers one explicit ZIP Save link. Inspect saved member hashes and actual outputs.
 
 - `export_document {format, allArtboards: true}` → PNG for social, JPG q≥85 where weight matters, PNG-8 or GIF for display banners under 150 KB (`check_spec {weigh: true}` measures), PDF for print (`allArtboards` → one page per artboard), SVG when vectors are wanted, PSD when a designer will open it in Photoshop, HTML5 for animated banners.
 - Animated: `set_keyframes` (position/opacity/rotation/scale with easing) then `export_document {format: "gif"}` or `"html"`. Keep GIFs ≤ 12 fps and short.
