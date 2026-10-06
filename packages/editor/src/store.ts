@@ -2,12 +2,12 @@ import { create } from "zustand";
 import type { AdDocument, AppliedOps, Layer, Op, OpEnvelope, ServerMessage, ClientMessage } from "@pictocity/core";
 import { applyOps, deepClone, findLayer, findParent, uid, isGroup, walk, cloneWithNewIds, makeGroup, makeShape, makeImage, makeAdjustment, layerBounds, cropOps, flipOps, ringsToPath, artboardOf, toLocal, combineSelections, captureComp, applyCompOps, keyframeOf, combineShapes as combineShapesCore, shapeToAnchors, anchorsToPath, traceRegions, type LayerStyles } from "@pictocity/core";
 import { rotateMembers } from "./transform";
-import { ensureAssets, TOKEN } from "./env";
+import { ensureAssets, setAssetConnection, TOKEN } from "./env";
 
 export type Tool = "move" | "direct" | "marquee" | "lasso" | "wand" | "text" | "shape" | "pen" | "brush" | "eraser" | "clone" | "heal" | "gradient" | "crop" | "eyedropper" | "hand" | "zoom" | "rotate";
 export type ShapeKind = "rect" | "ellipse" | "line" | "polygon" | "star";
 
-export interface HistoryEntry { label: string; ops: Op[]; inverse: Op[]; mergeKey?: string; at: number }
+export interface HistoryEntry { label: string; ops: Op[]; inverse: Op[]; mergeKey?: string; mergeEpoch?: number; at: number }
 
 export interface Presence { selection: string[]; cursor?: { x: number; y: number }; seen: number }
 
@@ -140,6 +140,10 @@ let visibilityHooked = false;
 /** Op counts of envelopes we've sent, so echoes can be matched and any server-added ops (linked layers) applied. */
 const pendingCounts: number[] = [];
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+// An undo, redo or fresh connection closes the preceding gesture even when a
+// later edit reuses its key within the time window.
+let mergeEpoch = 0;
+const MAX_MERGED_HISTORY_OPS = 512;
 
 /** Edits made while the connection is down wait here and are replayed after the next snapshot. */
 const outbox: OpEnvelope[] = [];
@@ -209,16 +213,18 @@ export const useStore = create<State>((set, get) => ({
   showToast: (msg) => { set({ toast: msg }); setTimeout(() => { if (get().toast === msg) set({ toast: null }); }, 1800); },
 
   connect(docId) {
+    mergeEpoch++;
     const actor = `editor:${get().clientId}`;
+    const switching = currentDocId !== docId;
     currentDocId = docId;
-    set({ actor, connection: "connecting", selection: [], undoStack: [], redoStack: [], log: [], presence: {}, editingTextId: null });
+    set({ actor, connection: "connecting", ...(switching ? { doc: null, modal: null } : {}), selection: [], undoStack: [], redoStack: [], log: [], presence: {}, editingTextId: null });
     pendingCounts.length = 0;
     if (reconnectTimer) clearTimeout(reconnectTimer);
     ws?.close();
     const proto = location.protocol === "https:" ? "wss" : "ws";
     ws = new WebSocket(`${proto}://${location.host}/ws${TOKEN ? `?token=${encodeURIComponent(TOKEN)}` : ""}`);
     const sock = ws;
-    sock.onopen = () => { set({ connection: "online" }); send({ kind: "subscribe", docId }); };
+    sock.onopen = () => { if (ws !== sock || currentDocId !== docId) return; set({ connection: "online" }); send({ kind: "subscribe", docId }); };
     sock.onclose = () => {
       if (ws !== sock) return;
       set({ connection: "offline" });
@@ -229,10 +235,11 @@ export const useStore = create<State>((set, get) => ({
       document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && get().connection === "offline" && currentDocId) get().connect(currentDocId); });
     }
     sock.onmessage = (ev) => {
+      if (ws !== sock || currentDocId !== docId) return;
       const msg = JSON.parse(ev.data) as ServerMessage;
       const st = get();
       if (msg.kind === "snapshot") {
-        ensureAssets(msg.doc);
+        if (msg.doc.id !== docId) return;
         const url = new URL(location.href); url.searchParams.set("doc", msg.doc.id); history.replaceState(null, "", url);
         // Replay anything edited while offline on top of the fresh snapshot, then send it.
         const queued = outbox.splice(0).filter((env) => env.docId === msg.doc.id);
@@ -240,7 +247,7 @@ export const useStore = create<State>((set, get) => ({
         for (const env of queued) { try { applyOps(doc, env.ops); } catch { /* stale: drop */ continue; } pendingCounts.push(env.ops.length); ws?.send(JSON.stringify({ kind: "ops", envelope: env, clientRev: doc.rev })); }
         if (queued.length) get().showToast(`Reconnected — sent ${queued.length} change(s) made offline`);
         set({ doc, selection: st.selection.filter((id) => findLayer(doc, id)), recentDocs: [{ id: doc.id, name: doc.name }, ...st.recentDocs.filter((d) => d.id !== doc.id)].slice(0, 8) });
-        fetch(`/api/docs/${docId}/history?since=0`).then((r) => r.json()).then((log: AppliedOps[]) => set({ log })).catch(() => undefined);
+        fetch(`/api/docs/${docId}/history?since=0`).then((r) => r.json()).then((log: AppliedOps[]) => { if (ws === sock && currentDocId === docId) set({ log }); }).catch(() => undefined);
       } else if (msg.kind === "applied") {
         const a = msg.applied;
         if (!st.doc || a.docId !== st.doc.id) return;
@@ -257,12 +264,11 @@ export const useStore = create<State>((set, get) => ({
         const doc = deepClone(st.doc);
         try { applyOps(doc, a.ops); doc.rev = a.rev; }
         catch { send({ kind: "subscribe", docId }); return; }
-        ensureAssets(doc);
         set({ doc, log: [...st.log, a], selection: st.selection.filter((id) => findLayer(doc, id)) });
         if (a.actor.startsWith("agent:")) {
           const touched = a.ops.map((o) => ("id" in o ? o.id : o.type === "layer.add" ? o.layer.id : "")).filter(Boolean);
           set({ presence: { ...get().presence, [a.actor]: { selection: touched, seen: Date.now() } } });
-          setTimeout(() => { const p = get().presence[a.actor]; if (p && Date.now() - p.seen >= 3900) { const n = { ...get().presence }; delete n[a.actor]; set({ presence: n }); } }, 4000);
+          setTimeout(() => { if (ws !== sock || currentDocId !== docId) return; const p = get().presence[a.actor]; if (p && Date.now() - p.seen >= 3900) { const n = { ...get().presence }; delete n[a.actor]; set({ presence: n }); } }, 4000);
         }
       } else if (msg.kind === "rejected") {
         pendingCounts.shift();
@@ -293,12 +299,13 @@ export const useStore = create<State>((set, get) => ({
     let inverse: Op[];
     try { inverse = applyOps(doc, ops); }
     catch (e) { get().showToast((e as Error).message); return; }
-    ensureAssets(doc);
     let undoStack = st.undoStack;
     const last = undoStack[undoStack.length - 1];
-    if (opts.mergeKey && last && last.mergeKey === opts.mergeKey && Date.now() - last.at < 1200) {
-      undoStack = [...undoStack.slice(0, -1), { ...last, ops: [...last.ops, ...ops], at: Date.now() }];
-    } else undoStack = [...undoStack, { label, ops, inverse, mergeKey: opts.mergeKey, at: Date.now() }].slice(-200);
+    if (opts.mergeKey && last && last.mergeKey === opts.mergeKey && last.mergeEpoch === mergeEpoch && Date.now() - last.at < 1200 && last.ops.length + ops.length <= MAX_MERGED_HISTORY_OPS && last.inverse.length + inverse.length <= MAX_MERGED_HISTORY_OPS) {
+      // Undo the newest batch first. Retaining only the first inverse loses
+      // later properties, layers, additions and removals in the same gesture.
+      undoStack = [...undoStack.slice(0, -1), { ...last, ops: [...last.ops, ...ops], inverse: [...inverse, ...last.inverse], at: Date.now() }];
+    } else undoStack = [...undoStack, { label, ops, inverse, mergeKey: opts.mergeKey, mergeEpoch, at: Date.now() }].slice(-200);
     set({ doc, undoStack, redoStack: [] });
     const envelope: OpEnvelope = { docId: doc.id, ops, actor: st.actor, label };
     pendingCounts.push(ops.length);
@@ -315,12 +322,13 @@ export const useStore = create<State>((set, get) => ({
   },
 
   undo() {
+    mergeEpoch++;
     const st = get();
     const entry = st.undoStack[st.undoStack.length - 1];
     if (!entry || !st.doc) return;
     const doc = deepClone(st.doc);
     let redoOps: Op[];
-    try { redoOps = applyOps(doc, entry.inverse); } catch (e) { get().showToast(`Can't undo: ${(e as Error).message}`); set({ undoStack: st.undoStack.slice(0, -1) }); return; }
+    try { redoOps = applyOps(doc, entry.inverse); } catch (e) { get().showToast(`Can't undo: ${(e as Error).message}`); return; }
     set({ doc, undoStack: st.undoStack.slice(0, -1), redoStack: [...st.redoStack, { ...entry, ops: redoOps, inverse: entry.inverse }] });
     pendingCounts.push(entry.inverse.length);
     send({ kind: "ops", envelope: { docId: doc.id, ops: entry.inverse, actor: st.actor, label: `Undo ${entry.label}` }, clientRev: doc.rev });
@@ -328,12 +336,13 @@ export const useStore = create<State>((set, get) => ({
   },
 
   redo() {
+    mergeEpoch++;
     const st = get();
     const entry = st.redoStack[st.redoStack.length - 1];
     if (!entry || !st.doc) return;
     const doc = deepClone(st.doc);
     let inverse: Op[];
-    try { inverse = applyOps(doc, entry.ops); } catch (e) { get().showToast(`Can't redo: ${(e as Error).message}`); set({ redoStack: st.redoStack.slice(0, -1) }); return; }
+    try { inverse = applyOps(doc, entry.ops); } catch (e) { get().showToast(`Can't redo: ${(e as Error).message}`); return; }
     set({ doc, redoStack: st.redoStack.slice(0, -1), undoStack: [...st.undoStack, { ...entry, inverse, at: Date.now() }] });
     pendingCounts.push(entry.ops.length);
     send({ kind: "ops", envelope: { docId: doc.id, ops: entry.ops, actor: st.actor, label: `Redo ${entry.label}` }, clientRev: doc.rev });
@@ -876,6 +885,12 @@ export const useStore = create<State>((set, get) => ({
     get().dispatch([{ type: "layer.set", id, props }], label ?? `Edit ${l?.name ?? "layer"}`, { mergeKey });
   },
 }));
+
+// Cover snapshots, undo/redo and transient/local ops through one asset lifecycle boundary.
+useStore.subscribe((state, previous) => {
+  if (state.doc !== previous.doc) ensureAssets(state.doc);
+  if (state.connection !== previous.connection) setAssetConnection(state.connection === "online");
+});
 
 /** Like Photoshop: undoing a delete (or redoing an add) selects the layers that came back; removed layers drop out of the selection. */
 function reselectAfter(ops: Op[]) {
