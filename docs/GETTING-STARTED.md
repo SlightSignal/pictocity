@@ -2,16 +2,16 @@
 
 ## YOUR FIRST AD FORMAT SET
 
-Open a finished demo, make an edit, then let Claude work beside you in the same document. pictocity is free and local; your AI assistant is a separate connection.
+Open a finished demo, make an edit, then let Claude work beside you in the same document. Pictocity source is local software; your AI assistant is a separate connection. This source package contains the procedural demo, not anyone's saved documents.
 
 ### 1. Install and start
 
-Install **Node.js 20 or newer**. Download [pictocity](https://github.com/SlightSignal/pictocity) with **Code → Download ZIP**, extract it, and open the folder containing `package.json`.
+Install **Node.js 22.20+ in the 22 branch, 24.12+ in the 24 branch, or 25+**. These prerequisites follow the committed dependency lock. Download [pictocity](https://github.com/SlightSignal/pictocity) with **Code → Download ZIP**, extract it, and open the folder containing `package.json`.
 
 On Windows, click File Explorer's address bar, type `cmd`, and press Enter. In that command window, enter these lines separately. Wait for the first two to finish:
 
 ```text
-npm install
+npm ci
 npm run build
 npm run server
 ```
@@ -25,6 +25,8 @@ Open a second command window in the same folder and run:
 ```text
 npm run demo
 ```
+
+Before launching the demo, confirm this is your new source checkout's server and its `./data` folder, rather than an existing desktop library.
 
 Visit **http://localhost:4100**, open the document picker, and choose the demo. It is the coffee ad shown in the README. Your canvas is in the middle; **Properties**, **Layers**, and **History** are on the right. Double-click the headline to edit it, then click away to commit. Changes save automatically.
 
@@ -64,4 +66,7 @@ Give Claude the bundled `skills/ad-campaign/SKILL.md` and ask it to adapt the de
 
 Ask Claude to run **check_spec** for each artboard's platform, fix errors, and render previews. Review every size yourself.
 
-Choose **File → Export As**, select **PNG**, and set the scope to **each artboard**. Download the files or save them to the server's exports folder; **File → Show exports** lists saved outputs. Use **Save As** to keep a portable `.pictocity` package with the editable document and images.
+Choose **File → Export As**, select **PNG**, and set the scope to **each artboard**. For multiple files, the dialog prepares one explicit ZIP Save link plus individual links. A link does not prove Windows saved the bytes. Download the files or save them to the server's exports folder; **File → Show exports** lists saved outputs. Use **Save As** to keep a portable `.pictocity` package with the editable document and images.
+
+
+Source-build checks and private test data are described in [TESTING.md](TESTING.md). Windows binary requirements and unresolved distribution gates are in [RELEASE.md](RELEASE.md).
