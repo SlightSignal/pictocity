@@ -1,7 +1,7 @@
 {
   "name": "pictocity",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.6",
   "description": "Photoshop-style ad editor with a JSON layer document, a headless renderer and an MCP server so an agent and a human can edit the same file.",
   "workspaces": [
     "packages/*"
@@ -16,7 +16,29 @@
     "test:ui": "node tools/ui-smoke.mjs",
     "doctor": "node tools/doctor.mjs",
     "check": "npm run build && npm test",
-    "test:api": "node tools/api-tests.mjs"
+    "test:api": "node tools/api-tests.mjs",
+    "test:reliability": "node tools/reliability-tests.mjs",
+    "test:mcp": "node tools/mcp-tests.mjs",
+    "test:modern": "node tools/modern-tests.mjs",
+    "test:snapshots": "node tools/snapshot-tests.mjs",
+    "test:snapshot-api": "node tools/snapshot-api-tests.mjs",
+    "test:recovery": "node tools/recovery-integrity-tests.mjs",
+    "test:fonts": "node tools/font-identity-tests.mjs",
+    "test:downloads": "node tools/export-download-tests.mjs",
+    "test:history": "node tools/editing-history-tests.mjs",
+    "test:cache-budget": "node tools/render-cache-budget-tests.mjs",
+    "test:persistence-ui": "node tools/persistence-status-tests.mjs",
+    "test:legacy-documents": "node tools/legacy-document-tests.mjs",
+    "test:font-inventory": "node tools/mcp-font-inventory-tests.mjs",
+    "test:data-ownership": "node tools/data-ownership-tests.mjs",
+    "test:assets": "node tools/asset-boundary-tests.mjs",
+    "test:asset-deadlines": "node tools/asset-deadline-tests.mjs",
+    "test:cache": "node tools/cache-consistency-tests.mjs",
+    "test:export-sets": "node tools/export-set-tests.mjs",
+    "test:export-frontend": "node tools/export-set-frontend-tests.mjs",
+    "test:export-mcp": "node tools/export-set-mcp-tests.mjs",
+    "test:export-regressions": "node tools/export-set-regressions.mjs",
+    "test:security": "node tools/security-checks.mjs"
   },
   "devDependencies": {
     "puppeteer-core": "^25.10.0"

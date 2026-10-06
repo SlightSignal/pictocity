@@ -15,3 +15,21 @@ dist_exe/
 *.log
 fonts/Test-*.ttf
 packaging/*.spec
+bin/
+
+# Private user work and generated verification evidence
+**/*-evidence/
+**/__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+exports/
+uploads/
+client-data/
+client-work/
+campaigns/
+*.history.jsonl
+*.pictocity
+*.pictocity-package
+tools/.snapshot-tests-*/
