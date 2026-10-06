@@ -4,7 +4,7 @@ import { renderDocument, layerCorners, layerBounds, pickLayer, findLayer, isGrou
 import { localToDoc } from "../transform";
 import { documentAtTime } from "@pictocity/core";
 import { useStore, topLevelOnly, unionBounds } from "../store";
-import { browserEnv, onAssetsChanged, measureText, renderCache } from "../env";
+import { browserEnv, onAssetsChanged, measureText, renderCache, mountAssetRefresh, refreshAssets, assetStatus, getAssetVersion } from "../env";
 
 import { scaleProps, virtualLayer, mapMembersToBox, rotateMembers, type Handle, type Box } from "../transform";
 
@@ -53,6 +53,7 @@ function displayBounds(l: Layer) {
 
 export function CanvasView() {
   const doc = useStore((s) => s.doc);
+  const connection = useStore((s) => s.connection);
   const zoom = useStore((s) => s.zoom);
   const pan = useStore((s) => s.pan);
   const tool = useStore((s) => s.tool);
@@ -99,10 +100,11 @@ export function CanvasView() {
 
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const rendered = useRef<{ canvas: HTMLCanvasElement; scale: number } | null>(null);
+  const rendered = useRef<{ canvas: HTMLCanvasElement; scale: number; docId: string; assetVersion: number } | null>(null);
   /** Rasterised layers from the last render, for pixel-accurate hit testing (top-level and pass-through-group layers). */
   const rasters = useRef(new Map<string, { canvas: HTMLCanvasElement; x: number; y: number; scale: number }>());
   const pixelTest = (l: Layer, p: { x: number; y: number }): boolean | undefined => {
+    if (rendered.current?.docId !== doc?.id || rendered.current?.assetVersion !== getAssetVersion()) return undefined;
     if (l.type === "text") return undefined; // the whole text box counts, so you don't have to hit a glyph
     const r = rasters.current.get(l.id); if (!r) return undefined;
     const x = Math.floor(p.x * r.scale - r.x), y = Math.floor(p.y * r.scale - r.y);
@@ -141,21 +143,30 @@ export function CanvasView() {
 
   useEffect(() => { if (doc && size.w && fittedFor.current !== doc.id) { fittedFor.current = doc.id; fit(); } }, [doc, size, fit]);
   useEffect(() => { (window as unknown as { __fit: () => void }).__fit = fit; }, [fit]);
-  useEffect(() => { const off = onAssetsChanged(() => setAssetTick((t) => t + 1)); return () => { off(); }; }, []);
+  useEffect(() => {
+    const off = onAssetsChanged(() => {
+      if (rendered.current?.assetVersion !== getAssetVersion()) { rendered.current = null; rasters.current.clear(); paint(); }
+      setAssetTick((t) => t + 1);
+    });
+    const unmount = mountAssetRefresh();
+    return () => { off(); unmount(); rendered.current = null; rasters.current.clear(); delete (window as unknown as { __layerAlpha?: unknown }).__layerAlpha; };
+  }, []);
 
   // ---- Render document to an offscreen canvas at the current zoom ---------------------
   useEffect(() => {
-    if (!doc) { rendered.current = null; return; }
+    if (!doc) { rendered.current = null; rasters.current.clear(); paint(); return; }
     const dpr = window.devicePixelRatio || 1;
     // Cap the working raster (~48 MP, 16384 px per side) so zooming into a huge pasteboard can't exhaust memory.
     const scale = Math.max(0.02, Math.min(zoom * dpr, 3, 16384 / Math.max(doc.width, doc.height), Math.sqrt(48e6 / (doc.width * doc.height))));
     let raf = requestAnimationFrame(() => {
+      if (useStore.getState().doc !== doc) return;
+      const assetVersion = getAssetVersion();
       const next = new Map<string, { canvas: HTMLCanvasElement; x: number; y: number; scale: number }>();
       const viewDoc = animating ? documentAtTime(doc, animTime) : doc;
       const c = renderDocument(viewDoc, browserEnv, { scale, hideLayerIds: editingTextId ? [editingTextId] : undefined, cache: renderCache, onLayer: (l, e) => next.set(l.id, { canvas: e.canvas as unknown as HTMLCanvasElement, x: e.x, y: e.y, scale }) }) as unknown as HTMLCanvasElement;
       rasters.current = next;
-      (window as unknown as { __layerAlpha?: (id: string) => unknown }).__layerAlpha = (id: string) => next.get(id);
-      rendered.current = { canvas: c, scale };
+      (window as unknown as { __layerAlpha?: (id: string) => unknown }).__layerAlpha = (id: string) => useStore.getState().doc?.id === doc.id && getAssetVersion() === assetVersion ? next.get(id) : undefined;
+      rendered.current = { canvas: c, scale, docId: doc.id, assetVersion };
       paint();
     });
     return () => cancelAnimationFrame(raf);
@@ -189,7 +200,7 @@ export function CanvasView() {
     for (let y = 0; y < dh; y += cell) for (let x = (y / cell) % 2 ? cell : 0; x < dw; x += cell * 2) ctx.fillRect(p.x + x, p.y + y, cell, cell);
     ctx.restore();
     const r = rendered.current;
-    if (r) { ctx.imageSmoothingEnabled = z * dpr < r.scale; ctx.drawImage(r.canvas, p.x, p.y, dw, dh); }
+    if (r?.docId === d.id && r.assetVersion === getAssetVersion()) { ctx.imageSmoothingEnabled = z * dpr < r.scale; ctx.drawImage(r.canvas, p.x, p.y, dw, dh); }
     if (useStore.getState().showGrid) {
       const g = useStore.getState().gridSize * z;
       if (g >= 6) {
@@ -342,8 +353,8 @@ export function CanvasView() {
     }
     if (tool === "wand") {
       // Flood at document resolution (capped at 4096 px) so the selection isn't limited to the screen's zoom level.
-      let r = rendered.current; if (!r) return;
-      if (r.scale < 1) { const s1 = Math.min(1, 4096 / Math.max(doc.width, doc.height)); const full = renderDocument(doc, browserEnv, { scale: s1, cache: renderCache }) as unknown as HTMLCanvasElement; r = { canvas: full, scale: s1 }; }
+      let r = rendered.current; if (!r || r.docId !== doc.id || r.assetVersion !== getAssetVersion()) return;
+      if (r.scale < 1) { const s1 = Math.min(1, 4096 / Math.max(doc.width, doc.height)); const full = renderDocument(doc, browserEnv, { scale: s1, cache: renderCache }) as unknown as HTMLCanvasElement; r = { ...r, canvas: full, scale: s1 }; }
       const rc = r.canvas.getContext("2d")!, W = r.canvas.width, H = r.canvas.height;
       const px0 = Math.floor(p.x * r.scale), py0 = Math.floor(p.y * r.scale);
       if (px0 < 0 || py0 < 0 || px0 >= W || py0 >= H) return;
@@ -406,7 +417,7 @@ export function CanvasView() {
     }
     if (tool === "eyedropper") {
       const r = rendered.current;
-      if (r) {
+      if (r?.docId === doc.id && r.assetVersion === getAssetVersion()) {
         const px = r.canvas.getContext("2d")!.getImageData(Math.floor(p.x * r.scale), Math.floor(p.y * r.scale), 1, 1).data;
         if (px[3] > 0) useStore.getState().setFgColor("#" + [px[0], px[1], px[2]].map((v) => v.toString(16).padStart(2, "0")).join(""));
       }
@@ -941,7 +952,7 @@ export function CanvasView() {
       <div className="empty">
         <div>
           <b>No document open</b>
-          Create a new ad or open one the agent made.<br />
+          Create a project or open one from your library.<br />
           <button className="btn primary" onClick={() => useStore.setState({ modal: "new" })}>New document</button>
           <button className="btn" onClick={() => { useStore.getState().refreshDocs(); useStore.setState({ modal: "open" }); }}>Open</button>
         </div>
@@ -954,6 +965,11 @@ export function CanvasView() {
   return (
     <div className="canvas-area" ref={wrapRef} style={{ cursor }} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onDoubleClick={onDoubleClick} onPointerLeave={() => { useStore.getState().set("hoverId", null); setBrushPos(null); }}>
       <canvas className="stage" ref={canvasRef} />
+      <div role="status" aria-live="polite" style={{ position: "absolute", right: 12, bottom: 12, zIndex: 5, maxWidth: 420, padding: 8, background: "var(--bg, #222)" }} onPointerDown={(e) => e.stopPropagation()}>
+        {connection !== "online" ? "Images paused while disconnected. " : assetStatus().checking ? "Checking image sources… " : assetStatus().pendingImages ? "Images need a refresh. " : ""}
+        {assetStatus().issues.map((issue, i) => <div key={i}>{issue}</div>)}
+        <button className="btn" disabled={connection !== "online" || assetStatus().checking} onClick={() => { void refreshAssets(); }}>Refresh images</button>
+      </div>
       <svg className="overlay">
         {doc.layers.filter((l): l is GroupLayer => isGroup(l) && !!l.artboard).map((a) => { const p = toScreen(a), q = toScreen({ x: a.x + a.width, y: a.y + a.height }); return <rect key={a.id} className="artboard-frame" x={p.x} y={p.y} width={q.x - p.x} height={q.y - p.y} />; })}
         {showGuides && doc.guides.map((g, i) => g.axis === "x" ? <line key={i} className="doc-guide" x1={toScreen({ x: g.position, y: 0 }).x} x2={toScreen({ x: g.position, y: 0 }).x} y1={0} y2={size.h} /> : <line key={i} className="doc-guide" y1={toScreen({ x: 0, y: g.position }).y} y2={toScreen({ x: 0, y: g.position }).y} x1={0} x2={size.w} />)}
