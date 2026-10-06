@@ -290,6 +290,8 @@ export type Op =
 export interface OpEnvelope {
   docId: string;
   ops: Op[];
+  /** Optional optimistic concurrency guard for API/agent edits made from a known document revision. */
+  expectedRev?: number;
   /** Who made the change: "editor:<clientId>" or "agent:<name>". Used for history labels and lock checks. */
   actor: string;
   /** Human-readable label for the history panel, e.g. "Move headline". */
