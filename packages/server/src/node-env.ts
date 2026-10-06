@@ -1,69 +1,130 @@
 import { createCanvas, loadImage, Path2D, GlobalFonts, type Image, type Canvas } from "@napi-rs/canvas";
-import { readdirSync, statSync } from "node:fs";
+import { readdirSync } from "node:fs";
 import { join, extname } from "node:path";
 import type { AdDocument, RenderEnv, CanvasLike } from "@pictocity/core";
 import { renderDocument, documentAtTime, findLayer, layerBounds, isGroup, walk, deepClone } from "@pictocity/core";
+import { videoPlan, encodeFrames, yieldFrame, ExportValidationError, type VideoOptions } from "./video-export.js";
 
-const imageCache = new Map<string, { image: Image; mtime: number }>();
+import { loadAssets } from "./assets.js";
+import { inspectFontFile, inspectFontBytes, type FontInspection, type FontStyle } from "./font-metadata.js";
+export { loadAssets } from "./assets.js";
 
-export interface FontInfo { family: string; files: string[] }
+export interface FontFaceInfo { file: string; weight: number; style: FontStyle; stretch: string; sha256: string; source: string; diagnostics: string[] }
+export interface FontInfo { family: string; files: string[]; faces: FontFaceInfo[] }
+export interface FontRegistration { registered: boolean; family: string | null; face: Omit<FontFaceInfo, "file"> | null; diagnostics: string[] }
+// Cache only successful registrations of identical bytes, never filename guesses.
+// Return copies so callers cannot mutate a future registration's identity.
+const registeredFonts = new Map<string, FontRegistration>();
+const systemFontFamilies = [...new Set(GlobalFonts.families.map(f => f.family))].sort();
+const fontIssues = new Map<string, { file: string; registered: boolean; diagnostics: string[] }>();
+const copyRegistration = (value: FontRegistration): FontRegistration => structuredClone(value);
+
+function registerInspected(inspection: FontInspection, register: (family?: string) => unknown): FontRegistration {
+  const cached = registeredFonts.get(inspection.sha256);
+  if (cached && (!cached.family || GlobalFonts.has(cached.family))) return copyRegistration(cached);
+  const before = GlobalFonts.families;
+  let key: unknown;
+  try { key = register(inspection.metadata?.family); }
+  catch (error) { return { registered: false, family: null, face: null, diagnostics: [...inspection.diagnostics, `Native font registration failed: ${(error as Error).message}`] }; }
+  if (!key) return { registered: false, family: null, face: null, diagnostics: [...inspection.diagnostics, "Native font registration failed"] };
+  const metadata = inspection.metadata;
+  let family = metadata?.family ?? null;
+  let face: FontRegistration["face"] = metadata ? { weight: metadata.weight, style: metadata.style, stretch: metadata.stretch, sha256: inspection.sha256, source: metadata.source, diagnostics: [...metadata.diagnostics] } : null;
+  const after = GlobalFonts.families;
+  if (!face) {
+    // Filename-independent native fallback, only when the final registration
+    // adds exactly one unambiguous family/style. No temporary aliases or probes.
+    const additions = after.flatMap(f => {
+      const prior = before.find(b => b.family === f.family);
+      return f.styles.filter(s => !prior?.styles.some(p => p.weight === s.weight && p.style === s.style && p.width === s.width)).map(s => ({ family: f.family, ...s }));
+    });
+    if (additions.length === 1) {
+      const actual = additions[0];
+      if (Number.isInteger(actual.weight) && actual.weight >= 1 && actual.weight <= 1000 && ["normal", "italic", "oblique"].includes(actual.style)) {
+        family = actual.family;
+        face = { weight: actual.weight, style: actual.style as FontStyle, stretch: actual.width, sha256: inspection.sha256, source: "native", diagnostics: [...inspection.diagnostics, "Descriptors recovered from unambiguous native registration"] };
+      }
+    }
+  } else if (!after.some(f => f.family === family && f.styles.some(s => s.weight === face!.weight && s.style === face!.style && s.width === face!.stretch))) {
+    // Do not advertise metadata the exporter did not actually register.
+    face = null;
+  }
+  const result: FontRegistration = { registered: true, family: face ? family : null, face, diagnostics: face?.diagnostics ?? [...inspection.diagnostics, "Native registration succeeded, but family/style metadata is unavailable or ambiguous; no browser descriptor advertised"] };
+  if (registeredFonts.size < 1024) registeredFonts.set(inspection.sha256, copyRegistration(result));
+  return result;
+}
+
+/** Upload admission uses the same metadata/native path as startup, before writing. */
+export function registerFontBytes(bytes: Buffer): FontRegistration {
+  try { return registerInspected(inspectFontBytes(bytes), family => GlobalFonts.register(bytes, family)); }
+  catch (error) { return { registered: false, family: null, face: null, diagnostics: [(error as Error).message] }; }
+}
+export function fontDiagnostics() { return [...fontIssues.values()].map(value => structuredClone(value)); }
 
 /** Animated GIF of the document's timeline (or a single frame when there is no animation). */
-export async function renderGif(doc: AdDocument, assetsDir: string, opts: { scale?: number; fps?: number; maxColors?: number } = {}): Promise<Buffer> {
+export async function renderGif(doc: AdDocument, assetsDir: string, opts: { scale?: number; fps?: number; maxColors?: number; signal?: AbortSignal } = {}): Promise<Buffer> {
+  const fps = opts.fps ?? doc.animation?.fps ?? 12, scale = opts.scale ?? 1;
+  const plan = videoPlan(doc, { fps, scale, ...(doc.animation ? {} : { duration: 1 / fps }) });
+  if (fps > 50 || plan.rasterWidth > 4096 || plan.rasterHeight > 4096 || plan.frames * plan.rasterWidth * plan.rasterHeight > 500e6) throw new ExportValidationError("GIF exceeds the 50 fps, 4096-pixel side or 500-million-pixel work budget");
+  const colors = opts.maxColors ?? 256;
+  if (!Number.isInteger(colors) || colors < 2 || colors > 256) throw new ExportValidationError("GIF colors must be an integer from 2 to 256");
+  const check = () => { if (opts.signal?.aborted) throw new Error("GIF export cancelled"); }; check();
   const { GIFEncoder, quantize, applyPalette } = await gifenc();
   const images = await loadAssets(doc, assetsDir); const env = nodeEnv(images);
-  const anim = doc.animation; const fps = opts.fps ?? anim?.fps ?? 12, scale = opts.scale ?? 1;
-  const frames = anim ? Math.max(1, Math.round((anim.duration / 1000) * fps)) : 1;
+  const anim = doc.animation, frames = anim ? plan.frames : 1;
   const gif = GIFEncoder();
   // One global palette from a spread of frames: per-frame palettes make flat colours flicker between frames.
-  const rendered: Canvas[] = [];
-  for (let i = 0; i < frames; i++) rendered.push(renderDocument(documentAtTime(doc, anim ? (i / fps) * 1000 : 0), env, { scale }) as unknown as Canvas);
   const sampleIdx = [...new Set([0, Math.floor(frames / 3), Math.floor((2 * frames) / 3), frames - 1])].filter((i) => i >= 0 && i < frames);
-  const sample = Buffer.concat(sampleIdx.map((i) => { const c = rendered[i]; return Buffer.from(c.getContext("2d").getImageData(0, 0, c.width, c.height).data.buffer); }));
-  const palette = quantize(new Uint8ClampedArray(sample.buffer, sample.byteOffset, sample.byteLength), opts.maxColors ?? 256, { format: "rgba4444" });
-  for (const c of rendered) {
+  // Bound palette sampling to ~1 MP total, independently of duration and output resolution.
+  const sampleScale = Math.min(scale, Math.sqrt(262144 / (doc.width * doc.height)));
+  const samples: Buffer[] = [];
+  for (const i of sampleIdx) { check(); const c = renderDocument(documentAtTime(doc, anim ? (i / fps) * 1000 : 0), env, { scale: sampleScale }) as unknown as Canvas;
+    const px = c.getContext("2d").getImageData(0, 0, c.width, c.height).data; samples.push(Buffer.from(px)); await yieldFrame(); }
+  const sample = Buffer.concat(samples);
+  const palette = quantize(new Uint8ClampedArray(sample.buffer, sample.byteOffset, sample.byteLength), colors, { format: "rgba4444" });
+  for (let i = 0; i < frames; i++) {
+    check(); const c = renderDocument(documentAtTime(doc, anim ? (i / fps) * 1000 : 0), env, { scale }) as unknown as Canvas;
     const { data } = c.getContext("2d").getImageData(0, 0, c.width, c.height);
     const index = applyPalette(data, palette, "rgba4444");
-    gif.writeFrame(index, c.width, c.height, { palette, delay: Math.round(1000 / fps), transparent: !doc.background, repeat: anim?.loop === false ? -1 : 0 });
+    // GIF stores centiseconds: distribute rounding rather than accumulating duration drift.
+    const delay = (Math.round((i + 1) * 100 / fps) - Math.round(i * 100 / fps)) * 10;
+    gif.writeFrame(index, c.width, c.height, { palette, delay, transparent: !doc.background, repeat: anim?.loop === false ? -1 : 0 });
+    if (i % 4 === 0) await yieldFrame();
   }
   gif.finish();
   return Buffer.from(gif.bytes());
 }
 
 /** Video of the timeline (MP4 H.264 or WebM VP9) via ffmpeg, optionally muxed with an audio file (e.g. a soundstudio render). */
-export async function renderVideo(doc: AdDocument, assetsDir: string, opts: { format?: "mp4" | "webm"; fps?: number; scale?: number; audioPath?: string; duration?: number; crf?: number }): Promise<Buffer> {
-  const { execFileSync } = await import("node:child_process"); const { mkdtempSync, readFileSync, rmSync } = await import("node:fs"); const { join } = await import("node:path"); const { tmpdir } = await import("node:os");
-  try { execFileSync("ffmpeg", ["-version"], { stdio: "ignore" }); } catch { throw new Error("ffmpeg is required for video export (install it and make sure it's on PATH)"); }
+export async function renderVideo(doc: AdDocument, assetsDir: string, opts: VideoOptions = {}): Promise<Buffer> {
+  const plan = videoPlan(doc, opts);
+  if (opts.signal?.aborted) throw new Error("Video export cancelled");
+  const { mkdtempSync, readFileSync, rmSync } = await import("node:fs"); const { tmpdir } = await import("node:os");
   const images = await loadAssets(doc, assetsDir); const env = nodeEnv(images);
-  const anim = doc.animation; const fps = opts.fps ?? anim?.fps ?? 24, scale = opts.scale ?? 1;
-  const duration = opts.duration ?? (anim ? anim.duration / 1000 : 5);
-  const frames = Math.max(1, Math.round(duration * fps));
+  const { fps, frames, width: w, height: h, duration, format, crf } = plan; const scale = opts.scale ?? 1;
   const dir = mkdtempSync(join(tmpdir(), "pictocity-video-"));
   try {
     // Even dimensions are required by yuv420p. Frames are streamed to ffmpeg as raw RGBA - no PNG encode, no temp files -
     // and a layer cache means only the animated layers re-rasterise per frame, which keeps memory flat.
-    let w = Math.round(doc.width * scale), h = Math.round(doc.height * scale); w -= w % 2; h -= h % 2;
     const cacheMap = new Map<string, import("@pictocity/core").CachedLayer>(); let bytes = 0;
-    const cache = { get: (k: string) => cacheMap.get(k), set: (k: string, e: import("@pictocity/core").CachedLayer) => { cacheMap.set(k, e); bytes += e.canvas.width * e.canvas.height * 4; while (bytes > 256 * 1024 * 1024 && cacheMap.size > 1) { const first = cacheMap.keys().next().value as string; const old = cacheMap.get(first)!; bytes -= old.canvas.width * old.canvas.height * 4; cacheMap.delete(first); } } };
+    const cache = { get: (k: string) => cacheMap.get(k), set: (k: string, e: import("@pictocity/core").CachedLayer) => { const prior = cacheMap.get(k); if (prior) bytes -= prior.canvas.width * prior.canvas.height * 4; cacheMap.set(k, e); bytes += e.canvas.width * e.canvas.height * 4; while (bytes > 256 * 1024 * 1024 && cacheMap.size > 1) { const first = cacheMap.keys().next().value as string; const old = cacheMap.get(first)!; bytes -= old.canvas.width * old.canvas.height * 4; cacheMap.delete(first); } } };
     const out = join(dir, `out.${opts.format ?? "mp4"}`);
     const args = ["-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgba", "-s", `${w}x${h}`, "-framerate", String(fps), "-i", "pipe:0"];
     if (opts.audioPath) args.push("-i", opts.audioPath);
-    if ((opts.format ?? "mp4") === "webm") args.push("-c:v", "libvpx-vp9", "-b:v", "0", "-crf", String(opts.crf ?? 32), "-pix_fmt", "yuv420p"); else args.push("-c:v", "libx264", "-preset", "medium", "-crf", String(opts.crf ?? 20), "-pix_fmt", "yuv420p", "-movflags", "+faststart");
-    if (opts.audioPath) args.push("-c:a", (opts.format ?? "mp4") === "webm" ? "libopus" : "aac", "-b:a", "192k", "-shortest");
-    args.push(out);
-    const { spawn } = await import("node:child_process");
-    const ff = spawn("ffmpeg", args, { stdio: ["pipe", "ignore", "pipe"] }); let err = ""; ff.stderr.on("data", (d) => { err += d.toString(); });
-    const done = new Promise<number>((res) => ff.on("close", res));
+    args.push("-map", "0:v:0");
+    if (format === "webm") args.push("-c:v", "libvpx-vp9", "-b:v", "0", "-crf", String(crf), "-pix_fmt", "yuv420p"); else args.push("-c:v", "libx264", "-preset", "medium", "-crf", String(crf), "-pix_fmt", "yuv420p", "-movflags", "+faststart");
+    if (opts.audioPath) args.push("-map", "1:a:0", "-af", "apad", "-c:a", format === "webm" ? "libopus" : "aac", "-b:a", "192k");
+    args.push("-t", String(duration), out);
     const even = createCanvas(w, h); const ec = even.getContext("2d");
-    for (let i = 0; i < frames; i++) {
+    async function* rawFrames() { for (let i = 0; i < frames; i++) {
       const c = renderDocument(documentAtTime(doc, (i / fps) * 1000), env, { scale, cache }) as unknown as Canvas;
-      ec.fillStyle = doc.background ?? "#000000"; ec.fillRect(0, 0, w, h); ec.drawImage(c, 0, 0, w, h);
+      ec.fillStyle = doc.background ?? "#000000"; ec.fillRect(0, 0, w, h); ec.drawImage(c, 0, 0);
       const px = ec.getImageData(0, 0, w, h).data;
-      if (!ff.stdin.write(Buffer.from(px.buffer, px.byteOffset, px.byteLength))) await new Promise<void>((res) => ff.stdin.once("drain", () => res()));
-    }
-    ff.stdin.end();
-    const code = await done;
-    if (code !== 0) throw new Error(`ffmpeg failed: ${err.slice(-400)}`);
+      yield Buffer.from(px.buffer, px.byteOffset, px.byteLength);
+      opts.onProgress?.(i + 1, frames);
+      if (i % 4 === 0) await yieldFrame();
+    } }
+    await encodeFrames(args, rawFrames(), { ...opts, timeoutMs: plan.timeoutMs });
     return readFileSync(out);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
@@ -99,51 +160,50 @@ export async function renderHtmlBanner(doc: AdDocument, assetsDir: string): Prom
 ${css.join("\n")}</style></head><body><div id="banner">${parts.join("")}</div></body></html>`;
 }
 
-/** Register one font file and work out which family it provides. */
+function registerFontDetails(fontsDir: string, f: string): FontRegistration {
+  const path = join(fontsDir, f);
+  let result: FontRegistration;
+  try { result = registerInspected(inspectFontFile(path), family => GlobalFonts.registerFromPath(path, family)); }
+  catch (error) { result = { registered: false, family: null, face: null, diagnostics: [(error as Error).message] }; }
+  if (result.diagnostics.length) fontIssues.set(path, { file: f, registered: result.registered, diagnostics: [...result.diagnostics] });
+  else fontIssues.delete(path);
+  return result;
+}
+/** Preserve the public string/null call shape; no fabricated filename families. */
 export function registerFontFile(fontsDir: string, f: string): string | null {
   if (![".ttf", ".otf", ".woff", ".woff2"].includes(extname(f).toLowerCase())) return null;
-  const before = new Set(GlobalFonts.families.map((x) => x.family));
-  const ok = GlobalFonts.registerFromPath(join(fontsDir, f));
-  if (!ok) return null;
-  const after = GlobalFonts.families.map((x) => x.family);
-  // A family that already existed (e.g. Poppins-Bold after Poppins-Regular) is matched by file name prefix.
-  const fresh = after.filter((x) => !before.has(x));
-  return fresh[0] ?? after.find((x) => f.toLowerCase().replace(/[-_ ]/g, "").startsWith(x.toLowerCase().replace(/[-_ ]/g, ""))) ?? f.replace(/\.[^.]+$/, "");
+  return registerFontDetails(fontsDir, f).family;
 }
 
 /** Register every font file in the folder and remember which family each file provides. */
 export function registerFonts(fontsDir: string): FontInfo[] {
-  const byFamily = new Map<string, string[]>();
+  const byFamily = new Map<string, FontInfo>();
   try {
+    const known: string[] = [], unknown: string[] = [];
     for (const f of readdirSync(fontsDir).sort()) {
-      const family = registerFontFile(fontsDir, f);
-      if (family) byFamily.set(family, [...(byFamily.get(family) ?? []), f]);
+      if (![".ttf", ".otf", ".woff", ".woff2"].includes(extname(f).toLowerCase())) continue;
+      try { (inspectFontFile(join(fontsDir, f)).metadata ? known : unknown).push(f); }
+      catch { unknown.push(f); }
+    }
+    // Admit known faces first. Otherwise an unknown face sorted before its
+    // known family can acquire a fallback descriptor only on a fresh process,
+    // making the upload and restart catalogs disagree.
+    for (const f of [...known, ...unknown]) {
+      const result = registerFontDetails(fontsDir, f);
+      if (!result.family || !result.face) continue;
+      const info = byFamily.get(result.family) ?? { family: result.family, files: [], faces: [] };
+      info.files.push(f); info.faces.push({ file: f, ...result.face }); byFamily.set(info.family, info);
     }
   } catch { /* no fonts dir yet */ }
-  return [...byFamily].map(([family, files]) => ({ family, files }));
+  return [...byFamily.values()];
 }
 
 export function listFontFamilies(): string[] {
   return [...new Set(GlobalFonts.families.map((f) => f.family))].sort();
 }
 
-/** Load every image asset referenced by the document from disk, honouring file changes. */
-export async function loadAssets(doc: AdDocument, assetsDir: string): Promise<Map<string, Image>> {
-  const out = new Map<string, Image>();
-  await Promise.all(Object.values(doc.assets).map(async (a) => {
-    const file = join(assetsDir, a.src.replace(/^\/assets\//, ""));
-    let mtime = 0;
-    try { mtime = statSync(file).mtimeMs; } catch { return; }
-    const cached = imageCache.get(file);
-    if (cached && cached.mtime === mtime) { out.set(a.id, cached.image); return; }
-    try {
-      const image = await loadImage(file);
-      imageCache.set(file, { image, mtime });
-      out.set(a.id, image);
-    } catch (e) { console.warn(`asset ${a.id} failed to load: ${(e as Error).message}`); }
-  }));
-  return out;
-}
+/** Only preexisting native families are system choices; unknown uploads aren't. */
+export function listSystemFontFamilies(): string[] { return [...systemFontFamilies]; }
 
 export function nodeEnv(images: Map<string, Image>): RenderEnv {
   return {
@@ -159,6 +219,13 @@ type Gif = { GIFEncoder: () => { writeFrame(index: Uint8Array, w: number, h: num
 async function gifenc(): Promise<Gif> { const mod = (await import("gifenc" as string)) as unknown as Gif & { default?: Gif }; return (typeof (mod as Partial<Gif>).GIFEncoder === "function" ? mod : (mod.default as Gif)) as Gif; }
 
 export async function renderToBuffer(doc: AdDocument, assetsDir: string, opts: { scale?: number; format?: ExportFormat; quality?: number; colors?: number; dpi?: number; lossless?: boolean; onlyLayerIds?: string[]; transparent?: boolean; region?: { x: number; y: number; width: number; height: number }; rootLayerIds?: string[]; trim?: boolean } = {}): Promise<Buffer> {
+  const scale = opts.scale ?? 1, format = opts.format ?? "png";
+  const width = Math.ceil((opts.region?.width ?? doc.width) * scale), height = Math.ceil((opts.region?.height ?? doc.height) * scale);
+  if (!Number.isFinite(scale) || scale <= 0 || ![width, height].every((v) => Number.isSafeInteger(v) && v > 0 && v <= 16384) || width * height > 64e6) throw new ExportValidationError("Requested raster exceeds the positive scale / 16384-side / 64 MP limit");
+  if (!["png", "jpeg", "webp", "avif", "tiff", "bmp", "pdf", "png8"].includes(format)) throw new ExportValidationError("Unsupported raster format");
+  if (opts.quality !== undefined && (!Number.isFinite(opts.quality) || opts.quality < 1 || opts.quality > 100)) throw new ExportValidationError("Quality must be between 1 and 100");
+  if (opts.colors !== undefined && (!Number.isInteger(opts.colors) || opts.colors < 2 || opts.colors > 256)) throw new ExportValidationError("Palette colors must be an integer from 2 to 256");
+  if (opts.dpi !== undefined && (!Number.isFinite(opts.dpi) || opts.dpi < 36 || opts.dpi > 2400)) throw new ExportValidationError("DPI must be between 36 and 2400");
   const images = await loadAssets(doc, assetsDir);
   let canvas = renderDocument(doc, nodeEnv(images), { scale: opts.scale ?? 1, onlyLayerIds: opts.onlyLayerIds, transparent: opts.transparent, region: opts.region, rootLayerIds: opts.rootLayerIds }) as unknown as Canvas;
   if (opts.trim) {
@@ -173,22 +240,21 @@ export async function renderToBuffer(doc: AdDocument, assetsDir: string, opts: {
       canvas = c;
     }
   }
-  const format = opts.format ?? "png";
   if (format === "png") return canvas.toBuffer("image/png");
   if (format === "jpeg") return canvas.toBuffer("image/jpeg", opts.quality ?? 90);
   if (format === "webp") return canvas.toBuffer("image/webp", opts.quality ?? 90);
   if (format === "avif") return canvas.toBuffer("image/avif", { quality: opts.quality ?? 70 });
-  const { width, height } = canvas; const { data } = canvas.getContext("2d").getImageData(0, 0, width, height);
+  const { width: outputWidth, height: outputHeight } = canvas; const { data } = canvas.getContext("2d").getImageData(0, 0, outputWidth, outputHeight);
   const f = await import("./formats.js");
-  if (format === "tiff") return f.encodeTiff(width, height, data);
-  if (format === "bmp") return f.encodeBmp(width, height, data);
+  if (format === "tiff") return f.encodeTiff(outputWidth, outputHeight, data);
+  if (format === "bmp") return f.encodeBmp(outputWidth, outputHeight, data);
   if (format === "png8") {
     const { quantize, applyPalette } = await gifenc();
     const palette = quantize(data, opts.colors ?? 256, { format: "rgba4444" }); const index = applyPalette(data, palette, "rgba4444");
-    return f.encodePng8(width, height, index, palette);
+    return f.encodePng8(outputWidth, outputHeight, index, palette);
   }
   // PDF: flatten on the document background (or white); JPEG page unless lossless is requested.
-  const flat = createCanvas(width, height); const fc = flat.getContext("2d"); fc.fillStyle = doc.background ?? "#ffffff"; fc.fillRect(0, 0, width, height); fc.drawImage(canvas, 0, 0);
-  if (opts.lossless) { const rgb = Buffer.alloc(width * height * 3); const px = fc.getImageData(0, 0, width, height).data; for (let i = 0, j = 0; i < px.length; i += 4, j += 3) { rgb[j] = px[i]; rgb[j + 1] = px[i + 1]; rgb[j + 2] = px[i + 2]; } return f.encodePdf([{ width, height, rgb }], opts.dpi ?? 72); }
-  return f.encodePdf([{ width, height, jpeg: flat.toBuffer("image/jpeg", opts.quality ?? 92) }], opts.dpi ?? 72);
+  const flat = createCanvas(outputWidth, outputHeight); const fc = flat.getContext("2d"); fc.fillStyle = doc.background ?? "#ffffff"; fc.fillRect(0, 0, outputWidth, outputHeight); fc.drawImage(canvas, 0, 0);
+  if (opts.lossless) { const rgb = Buffer.alloc(outputWidth * outputHeight * 3); const px = fc.getImageData(0, 0, outputWidth, outputHeight).data; for (let i = 0, j = 0; i < px.length; i += 4, j += 3) { rgb[j] = px[i]; rgb[j + 1] = px[i + 1]; rgb[j + 2] = px[i + 2]; } return f.encodePdf([{ width: outputWidth, height: outputHeight, rgb }], opts.dpi ?? 72); }
+  return f.encodePdf([{ width: outputWidth, height: outputHeight, jpeg: flat.toBuffer("image/jpeg", opts.quality ?? 92) }], opts.dpi ?? 72);
 }

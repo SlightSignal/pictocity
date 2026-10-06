@@ -405,6 +405,7 @@ export function applyOps(doc: AdDocument, ops: Op[]): Op[] {
   try {
     for (const op of ops) inverse.unshift(applyOp(doc, op));
   } catch (e) {
+    for (const key of Object.keys(doc)) if (!(key in snapshot)) delete (doc as unknown as Record<string, unknown>)[key];
     Object.assign(doc, snapshot);
     throw e;
   }

@@ -1,30 +1,44 @@
-# pictocity
+# Pictocity
+
+This repository distributes **source, documentation and generic tests**, not the private desktop library or a cleared Windows binary. See [source release and Windows packaging](docs/RELEASE.md).
+
+Current verification and remaining engineering gates: [Reliability and release evidence](docs/RELIABILITY.md). Older feature inventories are not certification of professional parity.
 
 A Photoshop-style ad editor that an AI agent and a person edit together, live. (Pictocity is an independent project: it borrows conventions so your muscle memory transfers, not Adobe's code, icons or assets. Photoshop is a trademark of Adobe Inc.)
 
-**Status:** v0.1.0 · Node 20+ · runs entirely on your machine — a local server on `localhost:4100` (loopback only by default), no account, no telemetry; nothing leaves the box unless you export it. What's missing is stated plainly in [What's next](#whats-next). MIT.
+**Status:** v0.2.6 · Windows desktop package · Node 22.20+ or 24.12+ for source development (matching the lock) · runs entirely on your machine — a local server on `localhost:4100` (loopback only by default), no account, no telemetry; optional URL imports and configured external tools can access the network. What's missing is stated plainly in [What's next](#whats-next). MIT.
 
-pictocity is the stills-and-layers half of a two-app pipeline: its sibling [Filmocity](https://github.com/SlightSignal/filmocity) is the video editor, built on the same idea — one document, human and agent editing it through the same operations, every change attributed and reversible. `skills/ad-campaign/SKILL.md` is the agent playbook for this app.
+Exports freeze referenced image bytes, added fonts and optional audio before rendering. The dialog and MCP tools can refuse resources that changed after preflight; server batches share a captured resource version, and multiple output scales keep separate filenames. Read the release evidence for limits, verification and remaining gates.
+
+Pictocity combines layered design and timeline exports in one local desktop app. It remains active alongside Filmocity, the video editor; these are the two apps intended for modernization. The desktop export dialog supports PNG, JPEG, WebP, AVIF, GIF, TIFF, BMP, PDF, SVG, PSD, HTML, MP4 and WebM. `skills/ad-campaign/SKILL.md` is the agent playbook for this app.
 
 ![The editor on the demo document — the History panel shows the agent's edits in orange](docs/img/editor.png)
 
-The document is a JSON layer tree. Everything else — the browser editor, the agent (via MCP), the exporter — reads and writes that document through the same operations, and one Canvas 2D renderer draws it in both the browser and Node. So what Claude sees in `render_preview` is exactly what you see on screen and exactly what gets exported.
+The document is a JSON layer tree. Everything else — the browser editor, the agent (via MCP), the exporter — reads and writes that document through the same operations, and one Canvas 2D renderer draws it in both the browser and Node. The preview and export share drawing logic. Browser fonts, native Canvas behavior, scaling and encoding still need checks against the actual exported file; shared code alone does not establish pixel or color fidelity.
 
 ```
 ┌─────────────────┐   ops over WebSocket   ┌──────────────────────┐   REST    ┌──────────────┐
-│  Editor (React) │◄──────────────────────►│  Document server     │◄─────────►│  MCP server  │◄── Claude Code /
-│  layers, tools, │                        │  JSON docs + history │           │  37 tools    │    Claude Desktop
-│  history, fx    │                        │  headless renderer   │           └──────────────┘
+│  Editor (React) │◄──────────────────────►│  Document server     │◄─────────►│  MCP server  │◄── Codex /
+│  layers, tools, │                        │  JSON docs + history │           │  38 tools    │    other MCP clients
+│  history, fx    │                        │  isolated renderer   │           └──────────────┘
 └─────────────────┘                        │  assets, fonts, export│
                                            └──────────────────────┘
 ```
 
+The current 0.2.6 source includes same-host ownership of physical data and document
+directories before stores and recovery, and 0.2.5 preserves hosted font records in
+`list_fonts`. It also retains one ZIP save for multi-file exports, strict recovery
+with retained evidence, font descriptors and merged undo/redo.
+See [modernization acceptance](docs/MODERNIZATION.md) for exact verification and
+remaining work. These changes do not establish Photoshop parity or print/HDR
+color support.
+
 ## Quick start
 
-New to this? Choose **Code → Download ZIP** on this page and extract it (no Git or GitHub account needed), install **Node.js 20 or newer** from nodejs.org, then open a terminal in the extracted folder containing `package.json` — on Windows, click File Explorer's address bar, type `cmd`, and press Enter. Run these one at a time, letting the first two finish ([GETTING-STARTED.md](docs/GETTING-STARTED.md) walks the whole first session):
+New to this? Choose **Code → Download ZIP** on this page and extract it (no Git or GitHub account needed), install **Node.js 22.20+ in the 22 branch, 24.12+ in the 24 branch, or 25+** from nodejs.org, then open a terminal in the extracted folder containing `package.json` — on Windows, click File Explorer's address bar, type `cmd`, and press Enter. Run these one at a time, letting the first two finish ([GETTING-STARTED.md](docs/GETTING-STARTED.md) walks the whole first session):
 
 ```text
-npm install
+npm ci
 npm run build
 npm run server          # http://localhost:4100  (data lives in ./data)
 ```
@@ -236,18 +250,20 @@ Environment: `PICTOCITY_PORT` (4100), `PICTOCITY_DATA` (./data), `PICTOCITY_FONT
 
 ## Fonts
 
-Drop `.ttf` / `.otf` files into `fonts/`, or install them without touching the server: File › Install font… in the editor, or the `install_font` tool (path or URL). The server registers them for headless rendering and serves them to the browser with `@font-face`, so both sides draw the same glyphs. Poppins is included. System fonts on the server machine are also available to the renderer, but the browser will only match them if they're installed there too — prefer the `fonts/` folder.
+Drop `.ttf` / `.otf` files into `fonts/`, or install them without touching the server: File › Install font… in the editor, or the `install_font` tool (path or URL). The server registers them for headless rendering and serves them with `@font-face`; descriptor metadata and load diagnostics do not prove complete glyph or browser/export shaping fidelity. Poppins is included. System fonts on the server machine are also available to the renderer, but the browser will only match them if they're installed there too — prefer the `fonts/` folder.
 
 ## Testing
 
-Three layers of verification ship with the code:
+See [Testing](docs/TESTING.md) for prerequisites and isolated-data commands. API and
+UI suites mutate their test library; never point them at your working library.
+The following entry points ship with the source:
 
 - `npm test` — `tools/core-tests.mjs`, ~70 property tests that need no browser: every op's inverse restores the document exactly; a kitchen-sink document of every feature renders and re-imports from its own SVG; neutral adjustments are pixel identities and non-neutral ones change pixels; Fill 0% + stroke leaves the interior empty; homographies map corners exactly and flips are involutions; selection boolean areas; keyframe exactness and monotone interpolation; wrapped text never exceeds its box; closed paths keep their anchor count through edits; PSD round trips keep groups, text, shapes and adjustments; validation rejects NaN, zero sizes, unknown blend modes and types, clamps opacity, and fills defaults into incomplete layers; output quality: no banding on stretched gradients, no aliasing on downsampled photos, linear-light midpoints and seams, colour ops matching their CSS-filter definitions.
 - `npm run test:api` — `tools/api-tests.mjs`, ~30 checks against a running server: 404/400 paths, batch atomicity, lock enforcement, abuse limits (giant render scales, absurd fps, out-of-range quality, path traversal), 20 concurrent writers with sequential revisions, WebSocket garbage tolerance and rejection reasons, on-disk JSON validity after bursts (writes are atomic).
 - `npm run test:ui` — `tools/ui-smoke.mjs`, ~200 headless-Chromium flows through the real editor against a running server (every tool, dialog, shortcut group, live sync, offline replay, cross-document paste, exports of every format).
 - `npm run doctor` — first-run environment check: Node version, builds, the native canvas binary on this platform, fonts, writable data folder, free port, image-tools config, token.
 
-The editor's renderer and the export renderer are held to the same output by a test (browser vs server render of a document with text, effects and filters differ on under 1% of pixels, all at anti-aliased glyph edges). SIGTERM/SIGINT flush debounced saves before exit, so stopping the container never loses the last edit; closing a tab with edits still queued offline asks first; a corrupt document file is skipped with a warning instead of stopping the server.
+A controlled fixture compares browser and server rendering; it does not establish every font, color profile or PSD round trip. Shutdown flushes acknowledged work within the tested process-lifecycle scope, without a universal power-loss guarantee. Corrupt committed records retain their bytes and diagnoses and visibly pause editing; an incomplete tail is handled separately. See [recovery integrity](docs/RECOVERY-INTEGRITY.md).
 
 Limits are enforced rather than hoped for: renders and exports cap at 16384 px per side / 64 MP, GIF fps at 1–60, quality 1–100, palette 2–256, document sides 1–8192; unknown formats and op types are 400s; document saves are atomic (temp file + rename). Agent layer references accept an id, a unique name, or `Artboard name/Layer name`; an ambiguous name fails with the candidates listed instead of picking one.
 
@@ -272,3 +288,23 @@ data/             documents, history, assets, exports (created at runtime)
 Not built (and honest about it): satin / contours / global light / blend-if, warp text, colour management and CMYK/print units (TIFF and PDF export exist, but as 8-bit sRGB), quick/object selection (an ML step — plug a model in through image tools), brush tips and dynamics, navigator/rotate-view/info panels. PSD import stays lossy for smart objects. On the AI side the plumbing is in place — point `image-tools.json` at a background remover, an upscaler or a generative-fill script and the agent can call them; image generation straight into a layer is the natural next tool.
 
 Sync is server-authoritative with last-write-wins per property; that's the right trade-off for one person plus one agent. If you want offline editing or a crowd, the op layer is where a CRDT (Yjs) would slot in.
+
+Version 0.2.5 preserves hosted font metadata through the agent font-list tool.
+Its output is a JSON array of system names and hosted family/face records.
+
+
+Version 0.2.6 admits one cooperating server process per physical data and docs
+directory on this host, before opening/replaying document journals or seeding
+fonts. Filesystem directory identities prevent case, junction, shared-docs and
+rename aliases from admitting another writer. A second desktop launch explains
+that the other instance must be closed. Windows named pipes are released by the
+OS on process exit, including a forced stop; there is no stale lock file to guess
+at or delete. Linux uses an abstract socket; other Unix hosts refuse an existing
+path socket and do not automatically remove a possibly live owner's evidence.
+Only the actual Windows platform is tested here. Direct external writers,
+older app versions, cross-machine/shared-filesystem writers and shared custom
+font/asset/export directories are outside this ownership guarantee. This is
+distinct from two-client/offline undo and power-loss durability.
+
+Implementation references: [Node IPC](https://nodejs.org/api/net.html#ipc-support)
+and [directory device/inode identity](https://nodejs.org/api/fs.html#statsino).

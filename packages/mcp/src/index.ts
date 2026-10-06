@@ -4,17 +4,23 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { readFileSync } from "node:fs";
 import {
   makeText, makeShape, makeImage, makeFill, makeGroup, makeAdjustment, makeBrush, cloneWithNewIds, findLayer, findParent, walk, layerBounds, addArtboardOps, artboards, copyToArtboardOps, textPathPreset, captureComp, applyCompOps, combineShapes, shapeToAnchors, anchorsToPath, CUSTOM_SHAPES, PLATFORM_SPECS,
   BLEND_MODES, type AdDocument, type Layer, type Op,
 } from "@pictocity/core";
 
 const BASE = process.env.PICTOCITY_URL ?? "http://localhost:4100";
-const ACTOR = `agent:${process.env.PICTOCITY_AGENT ?? "claude"}`;
+const ACTOR = `agent:${process.env.PICTOCITY_AGENT ?? "assistant"}`;
 const TOKEN = process.env.PICTOCITY_TOKEN ?? "";
 const AUTH: Record<string, string> = TOKEN ? { authorization: `Bearer ${TOKEN}` } : {};
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
+  if (path !== "/api/health") {
+    const health = await fetch(BASE + "/api/health", { headers: AUTH, signal: AbortSignal.timeout(5000) });
+    const identity = await health.json() as { app?: string; ok?: boolean };
+    if (!health.ok || identity.app !== "Pictocity" || !identity.ok) throw new Error(`The endpoint at ${BASE} is not a healthy Pictocity server. Start Pictocity and set PICTOCITY_URL to its actual port.`);
+  }
   let r: Response;
   try { r = await fetch(BASE + path, { ...init, headers: { "content-type": "application/json", ...AUTH, ...(init?.headers as Record<string, string> | undefined) } }); }
   catch (e) { throw new Error(`Cannot reach the pictocity server at ${BASE} (${(e as Error).message}). Start it with: npm run server`); }
@@ -24,7 +30,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 const getDoc = (id: string) => api<AdDocument>(`/api/docs/${id}`);
-const sendOps = (docId: string, ops: Op[], label: string) => api<{ rev: number }>(`/api/docs/${docId}/ops`, { method: "POST", body: JSON.stringify({ ops, actor: ACTOR, label }) });
+const sendOps = (docId: string, ops: Op[], label: string, expectedRev?: number) => api<{ rev: number }>(`/api/docs/${docId}/ops`, { method: "POST", body: JSON.stringify({ ops, actor: ACTOR, label, expectedRev }) });
 
 /** Accept a layer id or a (case-insensitive) layer name. */
 /**
@@ -83,6 +89,8 @@ const text = (t: string) => ({ content: [{ type: "text" as const, text: t }] });
 // ---- Schemas -----------------------------------------------------------------------
 
 const blend = z.enum(BLEND_MODES as [string, ...string[]]);
+// Fixed-length numeric arrays preserve tuple validation while exposing object-valued
+// items; Codex cannot deserialize draft-7 tuple arrays in that schema field.
 const common = {
   name: z.string().optional(),
   x: z.number().optional(), y: z.number().optional(), width: z.number().optional(), height: z.number().optional(),
@@ -102,18 +110,18 @@ const common = {
   }).optional().describe("Photoshop-style layer effects (fx)"),
   fillOpacity: z.number().min(0).max(1).optional().describe("opacity of the layer's own pixels, effects unaffected (Photoshop Fill)"),
   clipToBelow: z.boolean().optional().describe("clipping mask: show only where the nearest non-clipped layer below has pixels (photo clipped into a shape or text)"),
-  quad: z.tuple([z.number(), z.number(), z.number(), z.number(), z.number(), z.number(), z.number(), z.number()]).optional().describe("distort/perspective/skew: offsets of the corners TL,TR,BR,BL in layer pixels, e.g. [0,0, 0,40, 0,-40, 0,0] tilts the right edge"),
+  quad: z.array(z.number()).length(8).optional().describe("distort/perspective/skew: offsets of the corners TL,TR,BR,BL in layer pixels, e.g. [0,0, 0,40, 0,-40, 0,0] tilts the right edge"),
   filters: z.object({ blur: z.number().optional(), brightness: z.number().optional(), contrast: z.number().optional(), saturate: z.number().optional(), hueRotate: z.number().optional(), grayscale: z.number().optional(), sepia: z.number().optional(), invert: z.number().optional(), noise: z.number().optional().describe("film grain 0..1"),
     vibrance: z.number().optional().describe("-1..1"), exposure: z.object({ exposure: z.number(), offset: z.number(), gamma: z.number() }).optional(),
-    colorBalance: z.object({ shadows: z.tuple([z.number(), z.number(), z.number()]), midtones: z.tuple([z.number(), z.number(), z.number()]), highlights: z.tuple([z.number(), z.number(), z.number()]), preserveLuminosity: z.boolean().optional() }).optional().describe("cyan-red, magenta-green, yellow-blue -100..100 per tone range"),
+    colorBalance: z.object({ shadows: z.array(z.number()).length(3), midtones: z.array(z.number()).length(3), highlights: z.array(z.number()).length(3), preserveLuminosity: z.boolean().optional() }).optional().describe("cyan-red, magenta-green, yellow-blue -100..100 per tone range"),
     blackWhite: z.object({ reds: z.number(), yellows: z.number(), greens: z.number(), cyans: z.number(), blues: z.number(), magentas: z.number(), tint: z.string().optional() }).optional().describe("Photoshop Black & White; 50 = neutral"),
     photoFilter: z.object({ color: z.string(), density: z.number(), preserveLuminosity: z.boolean().optional() }).optional(),
     gradientMap: z.object({ stops: z.array(z.object({ pos: z.number(), color: z.string() })), reverse: z.boolean().optional() }).optional(),
-    channelMixer: z.object({ r: z.tuple([z.number(), z.number(), z.number(), z.number()]), g: z.tuple([z.number(), z.number(), z.number(), z.number()]), b: z.tuple([z.number(), z.number(), z.number(), z.number()]), monochrome: z.boolean().optional() }).optional().describe("each output = r,g,b weights + constant, 1 = 100%"),
+    channelMixer: z.object({ r: z.array(z.number()).length(4), g: z.array(z.number()).length(4), b: z.array(z.number()).length(4), monochrome: z.boolean().optional() }).optional().describe("each output = r,g,b weights + constant, 1 = 100%"),
     threshold: z.number().optional(), posterize: z.number().optional(), shadowsHighlights: z.object({ shadows: z.number(), highlights: z.number() }).optional(), colorize: z.object({ hue: z.number(), saturation: z.number(), lightness: z.number() }).optional(),
     unsharp: z.object({ amount: z.number(), radius: z.number() }).optional(), motionBlur: z.object({ angle: z.number(), distance: z.number() }).optional(), pixelate: z.number().optional(), emboss: z.number().optional(), findEdges: z.number().optional(),
     levels: z.object({ inBlack: z.number(), inWhite: z.number(), gamma: z.number(), outBlack: z.number(), outWhite: z.number() }).optional(),
-    curves: z.object({ rgb: z.array(z.tuple([z.number(), z.number()])).optional(), r: z.array(z.tuple([z.number(), z.number()])).optional(), g: z.array(z.tuple([z.number(), z.number()])).optional(), b: z.array(z.tuple([z.number(), z.number()])).optional() }).optional().describe("control points [input, output] 0-255") }).optional(),
+    curves: z.object({ rgb: z.array(z.array(z.number()).length(2)).optional(), r: z.array(z.array(z.number()).length(2)).optional(), g: z.array(z.array(z.number()).length(2)).optional(), b: z.array(z.array(z.number()).length(2)).optional() }).optional().describe("control points [input, output] 0-255") }).optional(),
   mask: z.union([
     z.object({ kind: z.literal("shape"), shape: z.enum(["rect", "ellipse"]), x: z.number(), y: z.number(), width: z.number(), height: z.number(), radius: z.number().optional(), feather: z.number().optional(), inverted: z.boolean().optional() }),
     z.object({ kind: z.literal("raster"), assetId: z.string(), inverted: z.boolean().optional() }),
@@ -125,20 +133,20 @@ const layerSpec = z.discriminatedUnion("type", [
   z.object({ type: z.literal("text"), text: z.string(), fontFamily: z.string().optional(), fontSize: z.number().optional(), fontWeight: z.union([z.number(), z.enum(["normal", "bold"])]).optional(), fontStyle: z.enum(["normal", "italic"]).optional(), color: z.string().optional(), align: z.enum(["left", "center", "right", "justify"]).optional(), verticalAlign: z.enum(["top", "middle", "bottom"]).optional(), lineHeight: z.number().optional(), letterSpacing: z.number().optional(), textTransform: z.enum(["none", "uppercase", "lowercase"]).optional(), underline: z.boolean().optional(), strikethrough: z.boolean().optional(), vertical: z.boolean().optional().describe("vertical type, characters stacked"), wrap: z.boolean().optional(), kerning: z.boolean().optional(), baselineShift: z.number().optional(), textScaleX: z.number().optional().describe("horizontal glyph scale, 1 = 100%"), textScaleY: z.number().optional(),
     runs: z.array(z.object({ start: z.number().int(), end: z.number().int(), color: z.string().optional(), fontWeight: z.union([z.number(), z.enum(["normal", "bold"])]).optional(), fontStyle: z.enum(["normal", "italic"]).optional(), underline: z.boolean().optional(), fontFamily: z.string().optional() })).optional().describe("style character ranges [start,end) - e.g. colour one word of the headline"),
     onPath: z.object({ preset: z.enum(["arc-up", "arc-down", "circle"]).optional().describe("arc over the top of the box, along the bottom, or a full circle"), path: z.string().optional().describe("custom SVG path in a 0..1 box"), align: z.enum(["start", "center", "end"]).optional(), offset: z.number().optional().describe("0..1 start position along the path"), flip: z.boolean().optional() }).optional().describe("set text on a path; the layer box is the path's bounding box"), ...common }),
-  z.object({ type: z.literal("shape"), shape: z.enum(["rect", "ellipse", "line", "polygon", "star", "path"]).optional(), preset: z.enum(["arrow", "double-arrow", "heart", "speech-bubble", "check", "cross", "bolt", "seal", "triangle", "diamond", "hexagon", "ribbon"]).optional().describe("built-in custom shape (sets shape=path with its outline)"), fill: z.string().nullable().optional(), strokeColor: z.string().nullable().optional(), strokeWidth: z.number().optional(), radius: z.number().optional(), radii: z.tuple([z.number(), z.number(), z.number(), z.number()]).optional().describe("per-corner radii tl,tr,br,bl"), sides: z.number().optional(), innerRadius: z.number().optional(), path: z.string().optional().describe("SVG path in a 0..1 box"), dash: z.array(z.number()).optional().describe("dash pattern e.g. [8,4]"), arrows: z.enum(["none", "start", "end", "both"]).optional().describe("arrowheads on line shapes"), ...common }),
+  z.object({ type: z.literal("shape"), shape: z.enum(["rect", "ellipse", "line", "polygon", "star", "path"]).optional(), preset: z.enum(["arrow", "double-arrow", "heart", "speech-bubble", "check", "cross", "bolt", "seal", "triangle", "diamond", "hexagon", "ribbon"]).optional().describe("built-in custom shape (sets shape=path with its outline)"), fill: z.string().nullable().optional(), strokeColor: z.string().nullable().optional(), strokeWidth: z.number().optional(), radius: z.number().optional(), radii: z.array(z.number()).length(4).optional().describe("per-corner radii tl,tr,br,bl"), sides: z.number().optional(), innerRadius: z.number().optional(), path: z.string().optional().describe("SVG path in a 0..1 box"), dash: z.array(z.number()).optional().describe("dash pattern e.g. [8,4]"), arrows: z.enum(["none", "start", "end", "both"]).optional().describe("arrowheads on line shapes"), ...common }),
   z.object({ type: z.literal("image"), assetId: z.string(), fit: z.enum(["fill", "contain", "cover"]).optional(), crop: z.object({ x: z.number(), y: z.number(), width: z.number(), height: z.number() }).optional(), ...common }),
-  z.object({ type: z.literal("fill"), fill: z.union([z.object({ kind: z.literal("solid"), color: z.string() }), z.object({ kind: z.literal("linear"), from: z.string(), to: z.string(), angle: z.number(), stops: z.tuple([z.number(), z.number()]).optional().describe("0..1 positions of from/to along the gradient") }), z.object({ kind: z.literal("radial"), from: z.string(), to: z.string() }), z.object({ kind: z.literal("pattern"), assetId: z.string(), scale: z.number() }), z.object({ kind: z.literal("gradient"), type: z.enum(["linear", "radial", "angle", "reflected", "diamond"]), angle: z.number(), stops: z.array(z.object({ pos: z.number(), color: z.string(), opacity: z.number().optional() })), scale: z.number().optional(), reverse: z.boolean().optional() }).describe("multi-stop gradient with transparency in any Photoshop style")]).optional(), ...common }),
+  z.object({ type: z.literal("fill"), fill: z.union([z.object({ kind: z.literal("solid"), color: z.string() }), z.object({ kind: z.literal("linear"), from: z.string(), to: z.string(), angle: z.number(), stops: z.array(z.number()).length(2).optional().describe("0..1 positions of from/to along the gradient") }), z.object({ kind: z.literal("radial"), from: z.string(), to: z.string() }), z.object({ kind: z.literal("pattern"), assetId: z.string(), scale: z.number() }), z.object({ kind: z.literal("gradient"), type: z.enum(["linear", "radial", "angle", "reflected", "diamond"]), angle: z.number(), stops: z.array(z.object({ pos: z.number(), color: z.string(), opacity: z.number().optional() })), scale: z.number().optional(), reverse: z.boolean().optional() }).describe("multi-stop gradient with transparency in any Photoshop style")]).optional(), ...common }),
   z.object({ type: z.literal("adjustment"), adjustment: z.object({ blur: z.number().optional(), brightness: z.number().optional(), contrast: z.number().optional(), saturate: z.number().optional(), hueRotate: z.number().optional(), grayscale: z.number().optional(), sepia: z.number().optional(), invert: z.number().optional(), noise: z.number().optional(),
     vibrance: z.number().optional().describe("-1..1"), exposure: z.object({ exposure: z.number(), offset: z.number(), gamma: z.number() }).optional(),
-    colorBalance: z.object({ shadows: z.tuple([z.number(), z.number(), z.number()]), midtones: z.tuple([z.number(), z.number(), z.number()]), highlights: z.tuple([z.number(), z.number(), z.number()]), preserveLuminosity: z.boolean().optional() }).optional().describe("cyan-red, magenta-green, yellow-blue -100..100 per tone range"),
+    colorBalance: z.object({ shadows: z.array(z.number()).length(3), midtones: z.array(z.number()).length(3), highlights: z.array(z.number()).length(3), preserveLuminosity: z.boolean().optional() }).optional().describe("cyan-red, magenta-green, yellow-blue -100..100 per tone range"),
     blackWhite: z.object({ reds: z.number(), yellows: z.number(), greens: z.number(), cyans: z.number(), blues: z.number(), magentas: z.number(), tint: z.string().optional() }).optional().describe("Photoshop Black & White; 50 = neutral"),
     photoFilter: z.object({ color: z.string(), density: z.number(), preserveLuminosity: z.boolean().optional() }).optional(),
     gradientMap: z.object({ stops: z.array(z.object({ pos: z.number(), color: z.string() })), reverse: z.boolean().optional() }).optional(),
-    channelMixer: z.object({ r: z.tuple([z.number(), z.number(), z.number(), z.number()]), g: z.tuple([z.number(), z.number(), z.number(), z.number()]), b: z.tuple([z.number(), z.number(), z.number(), z.number()]), monochrome: z.boolean().optional() }).optional().describe("each output = r,g,b weights + constant, 1 = 100%"),
+    channelMixer: z.object({ r: z.array(z.number()).length(4), g: z.array(z.number()).length(4), b: z.array(z.number()).length(4), monochrome: z.boolean().optional() }).optional().describe("each output = r,g,b weights + constant, 1 = 100%"),
     threshold: z.number().optional(), posterize: z.number().optional(), shadowsHighlights: z.object({ shadows: z.number(), highlights: z.number() }).optional(), colorize: z.object({ hue: z.number(), saturation: z.number(), lightness: z.number() }).optional(),
     unsharp: z.object({ amount: z.number(), radius: z.number() }).optional(), motionBlur: z.object({ angle: z.number(), distance: z.number() }).optional(), pixelate: z.number().optional(), emboss: z.number().optional(), findEdges: z.number().optional(),
     levels: z.object({ inBlack: z.number(), inWhite: z.number(), gamma: z.number(), outBlack: z.number(), outWhite: z.number() }).optional(),
-    curves: z.object({ rgb: z.array(z.tuple([z.number(), z.number()])).optional(), r: z.array(z.tuple([z.number(), z.number()])).optional(), g: z.array(z.tuple([z.number(), z.number()])).optional(), b: z.array(z.tuple([z.number(), z.number()])).optional() }).optional() }), ...common }),
+    curves: z.object({ rgb: z.array(z.array(z.number()).length(2)).optional(), r: z.array(z.array(z.number()).length(2)).optional(), g: z.array(z.array(z.number()).length(2)).optional(), b: z.array(z.array(z.number()).length(2)).optional() }).optional() }), ...common }),
   z.object({ type: z.literal("brush"), strokes: z.array(z.object({ points: z.array(z.number()).describe("flat [x0,y0,x1,y1,...] in layer-local px"), size: z.number(), color: z.string(), opacity: z.number().optional(), hardness: z.number().optional(), erase: z.boolean().optional(), fill: z.boolean().optional().describe("treat points as a closed polygon and fill it"), rings: z.array(z.array(z.number())).optional().describe("with fill: several polygons / holes (even-odd)"), clipRings: z.array(z.array(z.number())).optional() })).optional().describe("freehand strokes; the layer defaults to the full canvas so points are document pixels"), ...common }),
   z.object({ type: z.literal("group"), ...common }),
 ]);
@@ -173,7 +181,8 @@ function buildLayer(doc: AdDocument, spec: z.infer<typeof layerSpec>): Layer {
 
 // ---- Server --------------------------------------------------------------------------
 
-const server = new McpServer({ name: "pictocity", version: "0.1.0" });
+const metadata = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
+const server = new McpServer({ name: "pictocity", version: metadata.version });
 
 server.registerTool("list_documents", { description: "List ad documents on the pictocity server." }, async () => {
   const docs = await api<{ id: string; name: string; width: number; height: number; rev: number; updatedAt: string }[]>("/api/docs");
@@ -193,14 +202,14 @@ server.registerTool("install_font", {
   return text(`Installed ${r.file} as family "${r.family}"`);
 });
 
-server.registerTool("list_fonts", { description: "Font families available to the renderer. Drop .ttf/.otf files in the server's fonts/ folder to add more." }, async () => text((await api<string[]>("/api/fonts")).join(", ")));
+server.registerTool("list_fonts", { description: "Available system font names and hosted font families with files, face weight/style/stretch, content hashes and diagnostics." }, async () => text(JSON.stringify(await api<unknown[]>("/api/fonts"), null, 2)));
 
 server.registerTool("create_document", {
   description: "Create a new ad document. Coordinates are document pixels with (0,0) top-left.",
   inputSchema: { name: z.string(), width: z.number().int().positive(), height: z.number().int().positive(), background: z.string().nullable().optional().describe("CSS color or null for transparent; default #ffffff"), linearBlending: z.boolean().optional().describe("blend gradients and blurs in linear light (cleaner gradient midpoints, no dark blur halos); default off like Photoshop") },
 }, async ({ linearBlending, ...a }) => {
   const d = await api<AdDocument>("/api/docs", { method: "POST", body: JSON.stringify(a) });
-  if (linearBlending) await sendOps(d.id, [{ type: "doc.set", props: { linearBlending: true } }], "Linear blending");
+  if (linearBlending) await sendOps(d.id, [{ type: "doc.set", props: { linearBlending: true } }], "Linear blending", d.rev);
   return text(`Created ${d.id} (${d.width}x${d.height})${linearBlending ? ", linear-light blending" : ""}. Open in the editor: ${BASE}/?doc=${d.id}`);
 });
 
@@ -242,7 +251,7 @@ server.registerTool("replace_text", {
     if (next !== l.text) ops.push({ type: "layer.set", id: l.id, props: { text: next } });
   }
   if (!ops.length) return text("No text layers contained that.");
-  const r = await sendOps(docId, ops, `Replace "${find}"`);
+  const r = await sendOps(docId, ops, `Replace "${find}"`, doc.rev);
   return text(`Changed ${ops.length} text layer(s), rev ${r.rev}`);
 });
 
@@ -261,7 +270,7 @@ server.registerTool("combine_shapes", {
   const top = findParent(doc, sorted[sorted.length - 1].id)!;
   const ops: Op[] = [{ type: "layer.add", layer: result, parentId: top.parent?.id ?? null, index: top.index + 1 }];
   if (!keepOriginals) for (const l of sorted) ops.push({ type: "layer.remove", id: l.id });
-  const r = await sendOps(docId, ops, `Combine shapes (${op})`);
+  const r = await sendOps(docId, ops, `Combine shapes (${op})`, doc.rev);
   return text(`Created "${result.name}" id=${result.id} (${result.width}x${result.height} at ${result.x},${result.y}), rev ${r.rev}`);
 });
 
@@ -274,7 +283,7 @@ server.registerTool("convert_to_path", {
   if (l.type !== "shape") throw new Error("Not a shape layer");
   const anchors = shapeToAnchors(l);
   if (!anchors) throw new Error("This shape can't be converted");
-  const r = await sendOps(docId, [{ type: "layer.set", id: l.id, props: { shape: "path", path: anchorsToPath(anchors) } }], `Convert ${l.name} to path`);
+  const r = await sendOps(docId, [{ type: "layer.set", id: l.id, props: { shape: "path", path: anchorsToPath(anchors) } }], `Convert ${l.name} to path`, doc.rev);
   return text(`"${l.name}" is now a path with ${anchors.length} anchors (rev ${r.rev})`);
 });
 
@@ -285,7 +294,7 @@ server.registerTool("set_keyframes", {
   const doc = await getDoc(docId);
   const l = resolveLayer(doc, layerId);
   const anim = { fps: fps ?? doc.animation?.fps ?? 12, duration: duration ?? doc.animation?.duration ?? Math.max(1000, ...keyframes.map((k) => k.t)), loop: loop ?? doc.animation?.loop ?? true, tracks: { ...(doc.animation?.tracks ?? {}), [l.id]: keyframes } };
-  const r = await sendOps(docId, [{ type: "doc.set", props: { animation: anim } }], `Keyframes for ${l.name}`);
+  const r = await sendOps(docId, [{ type: "doc.set", props: { animation: anim } }], `Keyframes for ${l.name}`, doc.rev);
   return text(`${keyframes.length} keyframe(s) on "${l.name}"; timeline ${anim.duration} ms @ ${anim.fps} fps (rev ${r.rev})`);
 });
 
@@ -297,7 +306,7 @@ server.registerTool("save_comp", {
   const existing = (doc.comps ?? []).find((c) => c.name.toLowerCase() === name.toLowerCase());
   const comp = captureComp(doc, name, existing?.id);
   const comps = existing ? (doc.comps ?? []).map((c) => (c.id === existing.id ? comp : c)) : [...(doc.comps ?? []), comp];
-  const r = await sendOps(docId, [{ type: "doc.set", props: { comps } }], `Save comp ${name}`);
+  const r = await sendOps(docId, [{ type: "doc.set", props: { comps } }], `Save comp ${name}`, doc.rev);
   return text(`${existing ? "Updated" : "Saved"} comp "${name}" id=${comp.id} (${Object.keys(comp.states).length} layers, rev ${r.rev}). Export it with export_document {comp: "${name}"} or all comps with {allComps: true}.`);
 });
 
@@ -310,7 +319,7 @@ server.registerTool("apply_comp", {
   if (!c) throw new Error(`No comp "${comp}". Comps: ${(doc.comps ?? []).map((x) => x.name).join(", ") || "none"}`);
   const ops = applyCompOps(doc, c);
   if (!ops.length) return text(`Comp "${c.name}" already applied.`);
-  const r = await sendOps(docId, ops, `Apply comp ${c.name}`);
+  const r = await sendOps(docId, ops, `Apply comp ${c.name}`, doc.rev);
   return text(`Applied "${c.name}": ${ops.length} layer(s) changed, rev ${r.rev}`);
 });
 
@@ -340,9 +349,9 @@ server.registerTool("get_layer", {
 
 server.registerTool("apply_ops", {
   description: "Advanced: apply raw document operations in one undoable batch. Op types: layer.add {layer,parentId,index}, layer.set {id,props}, layer.remove {id}, layer.move {id,parentId,index}, layer.push {id,key,items} (append to a list such as strokes), layer.splice {id,key,index,count,items}, doc.set {props}, asset.add {asset}. Prefer the specific tools when they fit.",
-  inputSchema: { docId: z.string(), ops: z.array(z.record(z.any())), label: z.string().optional() },
-}, async ({ docId, ops, label }) => {
-  const r = await sendOps(docId, ops as unknown as Op[], label ?? `Apply ${ops.length} ops`);
+  inputSchema: { docId: z.string(), ops: z.array(z.record(z.any())), label: z.string().optional(), expectedRev: z.number().int().nonnegative().optional().describe("Revision fetched before planning this batch; stale edits are refused with a conflict") },
+}, async ({ docId, ops, label, expectedRev }) => {
+  const r = await sendOps(docId, ops as unknown as Op[], label ?? `Apply ${ops.length} ops`, expectedRev);
   return text(`Applied ${ops.length} op(s), rev ${r.rev}`);
 });
 
@@ -355,7 +364,7 @@ server.registerTool("add_layer", {
   const container = parentId ? (resolveLayer(doc, parentId) as { children?: Layer[] }).children : doc.layers;
   if (parentId && !container) throw new Error(`${parentId} is not a group`);
   const idx = index === undefined || index < 0 ? (container?.length ?? 0) : index;
-  const r = await sendOps(docId, [{ type: "layer.add", layer: built, parentId: parentId ? resolveLayer(doc, parentId).id : null, index: idx }], `Add ${built.name}`);
+  const r = await sendOps(docId, [{ type: "layer.add", layer: built, parentId: parentId ? resolveLayer(doc, parentId).id : null, index: idx }], `Add ${built.name}`, doc.rev);
   return text(`Added ${built.type} layer "${built.name}" id=${built.id} (rev ${r.rev})`);
 });
 
@@ -366,13 +375,13 @@ server.registerTool("update_layer", {
   const doc = await getDoc(docId);
   const l = resolveLayer(doc, layerId);
   resolveOnPath(props);
-  const r = await sendOps(docId, [{ type: "layer.set", id: l.id, props }], `Edit ${l.name}`);
+  const r = await sendOps(docId, [{ type: "layer.set", id: l.id, props }], `Edit ${l.name}`, doc.rev);
   return text(`Updated "${l.name}" (${Object.keys(props).join(", ")}) rev ${r.rev}`);
 });
 
 server.registerTool("remove_layer", { description: "Delete a layer (by id or name).", inputSchema: { docId: z.string(), layerId: z.string() } }, async ({ docId, layerId }) => {
   const doc = await getDoc(docId); const l = resolveLayer(doc, layerId);
-  const r = await sendOps(docId, [{ type: "layer.remove", id: l.id }], `Delete ${l.name}`);
+  const r = await sendOps(docId, [{ type: "layer.remove", id: l.id }], `Delete ${l.name}`, doc.rev);
   return text(`Removed "${l.name}" rev ${r.rev}`);
 });
 
@@ -384,7 +393,7 @@ server.registerTool("move_layer", {
   const pid = parentId ? resolveLayer(doc, parentId).id : (parentId === null ? null : findParent(doc, l.id)!.parent?.id ?? null);
   const container = pid ? (findLayer(doc, pid) as { children: Layer[] }).children : doc.layers;
   const idx = index < 0 ? container.length : index;
-  const r = await sendOps(docId, [{ type: "layer.move", id: l.id, parentId: pid, index: idx }], `Reorder ${l.name}`);
+  const r = await sendOps(docId, [{ type: "layer.move", id: l.id, parentId: pid, index: idx }], `Reorder ${l.name}`, doc.rev);
   return text(`Moved "${l.name}" to index ${idx} rev ${r.rev}`);
 });
 
@@ -393,7 +402,7 @@ server.registerTool("duplicate_layer", { description: "Duplicate a layer (and it
   const loc = findParent(doc, l.id)!;
   const copy = cloneWithNewIds(l);
   if (offset) { copy.x += offset; copy.y += offset; }
-  const r = await sendOps(docId, [{ type: "layer.add", layer: copy, parentId: loc.parent?.id ?? null, index: loc.index + 1 }], `Duplicate ${l.name}`);
+  const r = await sendOps(docId, [{ type: "layer.add", layer: copy, parentId: loc.parent?.id ?? null, index: loc.index + 1 }], `Duplicate ${l.name}`, doc.rev);
   return text(`Duplicated as "${copy.name}" id=${copy.id} rev ${r.rev}`);
 });
 
@@ -421,8 +430,10 @@ server.registerTool("render_preview", {
 
 server.registerTool("export_document", {
   description: "Export to disk on the server machine and return the file path. png/jpg/webp are flattened images (scale 2 = 2x resolution); psd is a layered Photoshop file with groups, editable text, layer styles, masks and artboards. artboard exports just that artboard; allArtboards exports every artboard to its own file.",
-  inputSchema: { docId: z.string(), format: z.enum(["png", "png8", "jpg", "webp", "avif", "gif", "tiff", "bmp", "pdf", "svg", "psd", "html", "mp4", "webm"]).optional().describe("png8 = palette PNG (small); gif = animated GIF of the timeline; pdf = one page (allArtboards → one page per artboard); html = HTML5 banner; mp4/webm = video of the timeline, optionally with `audio` (path or URL of a soundstudio render) muxed in"), fps: z.number().optional(), audio: z.string().optional().describe("for mp4/webm: audio file path or URL to mux (e.g. the soundstudio render URL)"), duration: z.number().optional().describe("for mp4/webm without a timeline: seconds of still video"), crf: z.number().optional(), transparent: z.boolean().optional().describe("ignore the canvas background colour"), colors: z.number().optional().describe("palette size for png8/gif"), dpi: z.number().optional().describe("pdf/tiff"), scale: z.number().positive().optional(), quality: z.number().min(1).max(100).optional(), path: z.string().optional().describe("absolute output path; defaults to data/exports/"), artboard: z.string().optional().describe("artboard id or name"), allArtboards: z.boolean().optional(), trim: z.boolean().optional().describe("crop the export to its non-transparent pixels (png/webp)"), comp: z.string().optional().describe("apply this layer comp before rendering"), allComps: z.boolean().optional().describe("export every layer comp to its own file") },
+  inputSchema: { docId: z.string(), expectedRev: z.number().int().nonnegative().optional().describe("Revision returned by get_document or preflight_document; stale exports refuse"), expectedResources: z.string().regex(/^[0-9a-f]{64}$/).optional().describe("resourceSnapshot.sha256 returned by preflight_document; refuses changed images or added fonts"), format: z.enum(["png", "png8", "jpg", "webp", "avif", "gif", "tiff", "bmp", "pdf", "svg", "psd", "html", "mp4", "webm"]).optional().describe("png8 = palette PNG (small); gif = animated GIF of the timeline; pdf = one page (allArtboards → one page per artboard); html = HTML5 banner; mp4/webm = video of the timeline, optionally with `audio` (path or URL of a soundstudio render) muxed in"), fps: z.number().optional(), audio: z.string().optional().describe("for mp4/webm: audio file path or URL to mux (e.g. the soundstudio render URL)"), duration: z.number().optional().describe("for mp4/webm without a timeline: seconds of still video"), crf: z.number().optional(), transparent: z.boolean().optional().describe("ignore the canvas background colour"), colors: z.number().optional().describe("palette size for png8/gif"), dpi: z.number().optional().describe("pdf/tiff"), scale: z.number().positive().optional(), quality: z.number().min(1).max(100).optional(), path: z.string().optional().describe("absolute output path; defaults to data/exports/"), artboard: z.string().optional().describe("artboard id or name"), allArtboards: z.boolean().optional(), trim: z.boolean().optional().describe("crop the export to its non-transparent pixels (png/webp)"), comp: z.string().optional().describe("apply this layer comp before rendering"), allComps: z.boolean().optional().describe("export every layer comp to its own file") },
 }, async ({ docId, allArtboards, allComps, ...rest }) => {
+  const snapshot = await getDoc(docId);
+  Object.assign(rest, { expectedRev: rest.expectedRev ?? snapshot.rev });
   if (rest.format === "pdf" && allArtboards) { const r = await api<{ path: string; url?: string; bytes: number; pages: number }>(`/api/docs/${docId}/export`, { method: "POST", body: JSON.stringify({ ...rest, artboards: true }) }); return text(`Exported ${r.pages}-page PDF to ${r.path} (${(r.bytes / 1024).toFixed(0)} KB)${r.url ? `\nURL: ${r.url.replace("http://localhost:4100", BASE)}` : ""}`); }
   if (allComps) {
     const r = await api<{ files: { name: string; path: string }[] }>(`/api/docs/${docId}/export`, { method: "POST", body: JSON.stringify({ ...rest, comps: true }) });
@@ -436,13 +447,39 @@ server.registerTool("export_document", {
   return text(`Exported ${r.width}x${r.height} to ${r.path} (${(r.bytes / 1024).toFixed(0)} KB)${r.url ? `\nURL: ${r.url.replace("http://localhost:4100", BASE)}` : ""}`);
 });
 
+server.registerTool("export_set", {
+  description: "Export a complete set of scales, artboards or layer comps to disk using one captured document/resource version. First inspect preflight_document and pass its revision and resourceSnapshot.sha256. Validates the whole set before rendering, preserves previous outputs on handled rendering/publication failures, and returns actual filenames, paths, dimensions and SHA-256 hashes. A destination directory is reserved until completion; concurrent sets for it refuse. Cleanup or incomplete rollback failures report retained recovery paths. This is not crash-atomic publication or creative approval.",
+  inputSchema: {
+    docId: z.string(),
+    expectedRev: z.number().int().nonnegative().describe("Reviewed revision from preflight_document"),
+    expectedResources: z.string().regex(/^[0-9a-f]{64}$/).describe("Reviewed resourceSnapshot.sha256 from preflight_document"),
+    scales: z.array(z.number().positive()).min(1).max(64).optional().describe("Distinct scales, default [1]; up to 64 total output files"),
+    format: z.enum(["png", "png8", "jpg", "webp", "avif", "gif", "tiff", "bmp", "pdf", "svg", "psd", "html", "mp4", "webm"]).optional(),
+    dir: z.string().optional().describe("Output directory; defaults to data/exports"),
+    path: z.string().optional().describe("Explicit file path for a single-member set; mutually exclusive with dir"),
+    artboard: z.string().optional(), allArtboards: z.boolean().optional(),
+    comp: z.string().optional(), allComps: z.boolean().optional(),
+    quality: z.number().min(1).max(100).optional(), colors: z.number().int().min(2).max(256).optional(),
+    dpi: z.number().min(36).max(2400).optional(), transparent: z.boolean().optional(), trim: z.boolean().optional(),
+    fps: z.number().min(1).max(120).optional(), duration: z.number().positive().max(600).optional(),
+    crf: z.number().min(0).max(63).optional(), audio: z.string().optional().describe("MP4/WebM audio file or URL captured once for the whole set"),
+  },
+}, async ({ docId, allArtboards, allComps, ...rest }) => text(JSON.stringify(await api(`/api/docs/${encodeURIComponent(docId)}/export-set`, {
+  method: "POST", body: JSON.stringify({ ...rest, destination: "server", artboards: allArtboards, comps: allComps }),
+}), null, 2)));
+
+server.registerTool("preflight_document", {
+  description: "Check a project's image, mask, pattern and font dependencies before exporting. Returns missing or unreadable resources and the checked revision. Every render also refuses missing resources.",
+  inputSchema: { docId: z.string() },
+}, async ({ docId }) => text(JSON.stringify(await api(`/api/docs/${docId}/preflight`), null, 2)));
+
 server.registerTool("add_artboard", {
   description: "Add an artboard (a format such as 1080x1080 or 1080x1920) next to the existing ones. Layers added with parentId = the artboard id are clipped to it; positions stay in document pixels, so offset them by the artboard's x/y (see get_document). For the first artboard, adoptExisting: true moves the document's current layers into it (\"artboard from layers\"). Then copy_to_artboard builds the other formats. Export one with export_document {artboard} or all with {allArtboards: true}.",
   inputSchema: { docId: z.string(), width: z.number().int().positive(), height: z.number().int().positive(), name: z.string().optional(), background: z.string().nullable().optional(), adoptExisting: z.boolean().optional() },
 }, async ({ docId, ...init }) => {
   const doc = await getDoc(docId);
   const { ops, artboard } = addArtboardOps(doc, init);
-  const r = await sendOps(docId, ops, `New artboard ${artboard.name}`);
+  const r = await sendOps(docId, ops, `New artboard ${artboard.name}`, doc.rev);
   return text(`Added artboard "${artboard.name}" id=${artboard.id} at ${artboard.x},${artboard.y} ${artboard.width}x${artboard.height} (rev ${r.rev}). Document is now ${Math.max(doc.width, artboard.x + artboard.width)}x${Math.max(doc.height, artboard.height)}.`);
 });
 
@@ -455,7 +492,7 @@ server.registerTool("copy_to_artboard", {
   const ids = layerIds.map((ref) => resolveLayer(doc, ref).id);
   const { ops, newIds } = copyToArtboardOps(doc, ids, target.id, { fit, link });
   if (!ops.length) return text("Nothing to copy.");
-  const r = await sendOps(docId, ops, `Copy to ${target.name}`);
+  const r = await sendOps(docId, ops, `Copy to ${target.name}`, doc.rev);
   return text(`Copied ${newIds.length} layer(s) into "${target.name}"${fit ? " (scaled to fit)" : ""}: ${newIds.join(", ")} (rev ${r.rev})`);
 });
 
@@ -466,7 +503,7 @@ server.registerTool("link_layers", {
   const doc = await getDoc(docId);
   const layers = layerIds.map((ref) => resolveLayer(doc, ref));
   const linkId = unlink ? null : (layers.find((l) => l.linkId)?.linkId ?? `link_${Date.now().toString(36)}`);
-  const r = await sendOps(docId, layers.map((l) => ({ type: "layer.set" as const, id: l.id, props: { linkId } })), unlink ? "Unlink layers" : "Link layers");
+  const r = await sendOps(docId, layers.map((l) => ({ type: "layer.set" as const, id: l.id, props: { linkId } })), unlink ? "Unlink layers" : "Link layers", doc.rev);
   return text(`${unlink ? "Unlinked" : "Linked"} ${layers.map((l) => l.name).join(", ")} (rev ${r.rev})`);
 });
 
@@ -481,7 +518,7 @@ server.registerTool("merge_layers", {
   const layer = makeImage({ name: name ?? "Merged", assetId: r.asset.id, x: r.x, y: r.y, width: r.width, height: r.height, fit: "fill" });
   const ops: Op[] = [{ type: "layer.add", layer, parentId: top.parent?.id ?? null, index: top.index + 1 }];
   if (!keepOriginals) for (const id of ids) ops.push({ type: "layer.remove", id });
-  const rr = await sendOps(docId, ops, "Merge layers");
+  const rr = await sendOps(docId, ops, "Merge layers", doc.rev + 1);
   return text(`Merged ${ids.length} layer(s) into image layer "${layer.name}" id=${layer.id} (${r.width}x${r.height} at ${r.x},${r.y}), rev ${rr.rev}`);
 });
 
@@ -506,10 +543,10 @@ server.registerTool("process_image", {
   if (mode === "new_layer") {
     const loc = findParent(doc, l.id)!;
     const copy = cloneWithNewIds(l); copy.name = `${l.name} (${tool})`; (copy as { assetId: string }).assetId = asset.id;
-    const r = await sendOps(docId, [{ type: "layer.add", layer: copy, parentId: loc.parent?.id ?? null, index: loc.index + 1 }], `${tool} on ${l.name}`);
+    const r = await sendOps(docId, [{ type: "layer.add", layer: copy, parentId: loc.parent?.id ?? null, index: loc.index + 1 }], `${tool} on ${l.name}`, doc.rev + 1);
     return text(`Added "${copy.name}" id=${copy.id} with assetId=${asset.id} (rev ${r.rev})`);
   }
-  const r = await sendOps(docId, [{ type: "layer.set", id: l.id, props: { assetId: asset.id } }], `${tool} on ${l.name}`);
+  const r = await sendOps(docId, [{ type: "layer.set", id: l.id, props: { assetId: asset.id } }], `${tool} on ${l.name}`, doc.rev + 1);
   return text(`Replaced the image of "${l.name}" with assetId=${asset.id} (${asset.width}x${asset.height}, rev ${r.rev})`);
 });
 

@@ -1,10 +1,15 @@
 // Core correctness tests (no browser needed): node tools/core-tests.mjs
 // Exercises the document model, renderer, interop and geometry with properties that must hold exactly.
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createCanvas } from "@napi-rs/canvas";
 import * as core from "../packages/core/dist/index.js";
-import { nodeEnv } from "../packages/server/dist/node-env.js";
+import { nodeEnv, registerFonts } from "../packages/server/dist/node-env.js";
 import { docToPsd, psdToDoc } from "../packages/server/dist/psd.js";
 
+registerFonts(fileURLToPath(new URL("../fonts", import.meta.url)));
 const { createDocument, applyOps, applyOp, deepClone, makeText, makeShape, makeFill, makeGroup, makeAdjustment, makeBrush, renderDocument, homography, applyHomography, combineSelections, documentAtTime, layoutText, svgToLayers, documentToSvg, combineShapes, parsePenPath, anchorsToPath, textPathPreset, CUSTOM_SHAPES, AD_PRESETS, flipOps, findLayer } = core;
 
 let pass = 0, fail = 0;
@@ -150,9 +155,10 @@ const nonEmpty = (c) => { const p = pixels(c); for (let i = 3; i < p.length; i +
 {
   const doc = createDocument({ name: "rt", width: 300, height: 200, background: "#fff" });
   doc.layers = [makeGroup({ name: "G", children: [makeText({ name: "Head", text: "Hi", x: 10, y: 10, width: 100, height: 40, fontSize: 30 }), makeShape({ name: "Box", shape: "rect", x: 20, y: 60, width: 80, height: 50, fill: "#f00", styles: { dropShadow: { enabled: true, color: "#000", blur: 5, x: 1, y: 1, opacity: 0.5 } } })] }), makeAdjustment({ name: "Adj", x: 0, y: 0, width: 300, height: 200, adjustment: { exposure: { exposure: 0.5, offset: 0, gamma: 1 } } })];
+  const psdTemp = mkdtempSync(join(tmpdir(), "pictocity-psd-test-"));
   try {
-    const buf = await docToPsd(doc, "/tmp");
-    const back = await psdToDoc(buf, "rt2", "/tmp");
+    const buf = await docToPsd(doc, psdTemp);
+    const back = await psdToDoc(buf, "rt2", psdTemp);
     const names = [...core.walk(back.layers)].map((w) => w.layer.name);
     check("psd round trip keeps group, text, shape and adjustment", names.includes("G") && names.includes("Head") && names.includes("Box") && names.includes("Adj"), names.join(","));
     const head = findLayer(back, [...core.walk(back.layers)].find((w) => w.layer.name === "Head").layer.id);
@@ -161,11 +167,11 @@ const nonEmpty = (c) => { const p = pixels(c); for (let i = 3; i < p.length; i +
     // style runs survive the round trip
     const rdoc = createDocument({ name: "runs", width: 300, height: 100, background: "#fff" });
     rdoc.layers = [makeText({ name: "R", text: "Hot summer", x: 0, y: 0, width: 300, height: 60, fontSize: 30, color: "#000000", runs: [{ start: 0, end: 3, color: "#ff0000", fontWeight: 700 }] })];
-    const rback = await psdToDoc(await docToPsd(rdoc, "/tmp"), "runs2", "/tmp");
+    const rback = await psdToDoc(await docToPsd(rdoc, psdTemp), "runs2", psdTemp);
     const rl = [...core.walk(rback.layers)].map((w) => w.layer).find((l) => l.type === "text");
     check("psd round trip keeps character runs", !!rl?.runs && rl.runs[0].start === 0 && rl.runs[0].end === 3 && rl.runs[0].color === "#ff0000", JSON.stringify(rl?.runs));
     check("psd round trip keeps the exposure adjustment", adj.type === "adjustment" && Math.abs((adj.adjustment.exposure?.exposure ?? 0) - 0.5) < 0.01);
-  } catch (e) { check("psd round trip", false, e.message); }
+  } catch (e) { check("psd round trip", false, e.message); } finally { rmSync(psdTemp, { recursive: true, force: true }); }
 }
 
 // ---- 10. Presets are sane -------------------------------------------------------------

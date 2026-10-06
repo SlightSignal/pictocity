@@ -6,6 +6,8 @@ import { topLevelOnly } from "../store";
 import { useStore } from "../store";
 import { loadFonts, servedFamilies } from "../env";
 import { CanvasView } from "./CanvasView";
+import { PersistenceNotice } from "./PersistenceNotice";
+import { persistenceMonitor } from "../persistence-status";
 import { LayersPanel } from "./LayersPanel";
 import { PropertiesPanel } from "./PropertiesPanel";
 import { MenuBar, ToolBar, OptionsBar, HistoryPanel, StatusBar, Swatches, DocTabs, CompsPanel, Timeline, SHORTCUTS, zoomBy, zoomToSelection, exportDoc, toggleLock, toggleVisible, importPsdFile, importImageFile, importSvgFile } from "./Chrome";
@@ -56,7 +58,7 @@ export function App() {
         if (k === "s" && e.altKey && e.shiftKey) { e.preventDefault(); useStore.setState({ modal: "export" }); return; }  // Save for Web
         if (k === "w" && e.altKey && e.shiftKey) { e.preventDefault(); useStore.setState({ modal: "export" }); return; }  // Export As
         if (k === "s" && e.shiftKey) { e.preventDefault(); useStore.setState({ modal: "saveas" }); return; }
-        if (k === "s") { e.preventDefault(); st.showToast(`Saved — rev ${st.doc?.rev ?? 0} (every change autosaves)`); return; }
+        if (k === "s") { e.preventDefault(); const saved = persistenceMonitor.current(); st.showToast(saved.kind === "recovery" ? "Saved work needs recovery. Editing is paused." : st.connection !== "online" || saved.kind !== "healthy" ? "Could not verify saved work. Some changes may still be waiting to save." : "Autosave is connected."); void persistenceMonitor.refresh(); return; }
         if (k === "w") { e.preventDefault(); useStore.setState({ modal: "open" }); return; }          // close → back to Open
         if (k === "k" && e.altKey && e.shiftKey) { e.preventDefault(); useStore.setState({ modal: "shortcuts" }); return; }
         if (k === "k") { e.preventDefault(); useStore.setState({ modal: "prefs" }); return; }
@@ -218,6 +220,7 @@ export function App() {
         <CompsPanel />
         <HistoryPanel />
       </div>
+      <PersistenceNotice />
       <StatusBar />
       {modal === "new" && <NewDialog />}
       {modal === "open" && <OpenDialog2 />}
