@@ -26,6 +26,8 @@ import subprocess
 import sys
 import time
 import urllib.request
+import urllib.error
+import json
 
 
 def base_dir():
@@ -57,6 +59,24 @@ def free_port(preferred=4100):
         return s.getsockname()[1]
 
 
+def service_ready(url, data):
+    """A protected recovery library is an available service, not a startup timeout."""
+    try:
+        response = urllib.request.urlopen(url + "/api/health", timeout=1)
+    except urllib.error.HTTPError as error:
+        if error.code != 503:
+            return False
+        response = error
+    with response:
+        body = response.read(65537)
+        if len(body) > 65536:
+            return False
+        health = json.loads(body)
+    expected = os.path.normcase(os.path.abspath(data))
+    actual = health.get("paths", {}).get("data")
+    return health.get("app") == "Pictocity" and isinstance(actual, str) and os.path.normcase(os.path.abspath(actual)) == expected and isinstance(health.get("persistence", {}).get("ok"), bool)
+
+
 def _kill_child_with_me(proc):
     """Tie the node child's lifetime to this process using a Windows job object.
 
@@ -75,6 +95,11 @@ def _kill_child_with_me(proc):
         import ctypes
         from ctypes import wintypes
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]; k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]; k32.SetInformationJobObject.restype = wintypes.BOOL
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]; k32.OpenProcess.restype = wintypes.HANDLE
+        k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]; k32.AssignProcessToJobObject.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]; k32.CloseHandle.restype = wintypes.BOOL
 
         class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
             _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
@@ -83,7 +108,7 @@ def _kill_child_with_me(proc):
                         ("MinimumWorkingSetSize", ctypes.c_size_t),
                         ("MaximumWorkingSetSize", ctypes.c_size_t),
                         ("ActiveProcessLimit", wintypes.DWORD),
-                        ("Affinity", ctypes.POINTER(ctypes.c_ulong)),
+                        ("Affinity", ctypes.c_size_t),
                         ("PriorityClass", wintypes.DWORD),
                         ("SchedulingClass", wintypes.DWORD)]
 
@@ -112,11 +137,14 @@ def _kill_child_with_me(proc):
         info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         if not k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):
+            k32.CloseHandle(job)
             return
         h = k32.OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, False, proc.pid)
         if h:
-            k32.AssignProcessToJobObject(job, h)
+            assigned = k32.AssignProcessToJobObject(job, h)
             k32.CloseHandle(h)
+            if not assigned: k32.CloseHandle(job); return
+        else: k32.CloseHandle(job); return
         # deliberately leak the job handle: it must outlive this function and
         # close only when the process exits, which is what triggers the kill.
         globals()["_JOB_HANDLE"] = job
@@ -127,7 +155,7 @@ def _kill_child_with_me(proc):
 def _die(msg):
     try:
         import ctypes
-        ctypes.windll.user32.MessageBoxW(None, msg, "pictocity", 0x10)
+        ctypes.windll.user32.MessageBoxW(None, msg, "Pictocity", 0x10)
     except Exception:
         pass
     print(msg, file=sys.stderr)
@@ -135,6 +163,8 @@ def _die(msg):
 
 
 def main():
+    from windows_lifetime import bind_lifetime
+    bind_lifetime()
     base = base_dir()
     node = os.path.join(base, "node", "node.exe")
     app = os.path.join(base, "app")
@@ -147,7 +177,11 @@ def main():
         return
 
     beside = os.path.join(exe_dir(), "pictocity_data")
-    data = os.environ.get("PICTOCITY_DATA") or (
+    import argparse
+    parser = argparse.ArgumentParser(description="Pictocity desktop editor")
+    parser.add_argument("--data", help="Existing document data directory; no automatic move")
+    options = parser.parse_args()
+    data = options.data or os.environ.get("PICTOCITY_DATA") or (
         beside if os.path.isdir(beside) else os.path.join(os.path.expanduser("~"), "pictocity_data"))
     os.makedirs(data, exist_ok=True)
 
@@ -169,24 +203,39 @@ def main():
     env["PICTOCITY_DATA"] = data
     env["PICTOCITY_PORT"] = str(port)
     env["PICTOCITY_HOST"] = env.get("PICTOCITY_HOST", "127.0.0.1")   # never all-interfaces by default
-    fonts = os.path.join(base, "fonts")
-    if os.path.isdir(fonts):
-        env["PICTOCITY_FONTS"] = fonts
+    # Uploaded fonts must survive the onefile extraction directory being removed.
+    fonts = os.environ.get("PICTOCITY_FONTS") or os.path.join(data, "fonts")
+    bundled_fonts = os.path.join(base, "fonts")
+    if os.path.isdir(bundled_fonts):
+        # The server copies and registers these only after acquiring library
+        # ownership. A refused second launch must not seed or replace fonts.
+        env["PICTOCITY_BUNDLED_FONTS"] = bundled_fonts
+    env["PICTOCITY_FONTS"] = fonts
     env["NODE_ENV"] = "production"
+    binaries = os.path.join(base, "bin")
+    if os.path.isdir(binaries):
+        env["PATH"] = binaries + os.pathsep + env.get("PATH", "")
+        env["PICTOCITY_FFMPEG"] = os.path.join(binaries, "ffmpeg.exe")
 
     proc = subprocess.Popen([node, entry], cwd=app, env=env,
-                            stdout=sink, stderr=sink, stdin=subprocess.DEVNULL)
+                            stdout=sink, stderr=sink, stdin=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     _kill_child_with_me(proc)
 
     for _ in range(120):
         time.sleep(0.5)
         if proc.poll() is not None:
+            if proc.returncode == 73:
+                _die("Another Pictocity instance is using this library.\n\n"
+                     "Close that instance before opening it again.\nYour saved work has not been changed.")
+            if proc.returncode == 74:
+                _die("Pictocity cannot confirm exclusive access to this library.\n\n"
+                     "Review the data folder or choose another folder before opening it.\nLog:\n%s" % logpath)
             _die("pictocity's server exited immediately (code %s).\n\nLog:\n%s"
                  % (proc.returncode, logpath))
             return
         try:
-            urllib.request.urlopen(url + "/api/health", timeout=1)
-            break
+            if service_ready(url, data):
+                break
         except Exception:
             pass
     else:
@@ -195,8 +244,13 @@ def main():
         return
 
     try:
+        if os.environ.get("PICTOCITY_HEADLESS") == "1":
+            while proc.poll() is None: time.sleep(0.5)
+            return
         import webview
-        webview.create_window("pictocity", url, width=1600, height=1000, min_size=(1100, 700))
+        # Keep downloads behind the native Save As dialog; pywebview defaults to cancelling them.
+        webview.settings["ALLOW_DOWNLOADS"] = True
+        webview.create_window("Pictocity", url, width=1600, height=1000, min_size=(1100, 700), maximized=True)
         webview.start()
     except Exception:
         import webbrowser
@@ -210,8 +264,10 @@ def main():
     finally:
         try:
             proc.terminate()
+            proc.wait(timeout=10)
         except Exception:
-            pass
+            try: proc.kill(); proc.wait(timeout=5)
+            except Exception: pass
 
 
 if __name__ == "__main__":
